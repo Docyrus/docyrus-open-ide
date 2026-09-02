@@ -672,7 +672,9 @@ fn addRecentProject(model: *Model, raw_path: []const u8) void {
 
 fn addProject(model: *Model, raw_path: []const u8) ?u32 {
     const path = normalizeProjectPath(raw_path);
-    if (path.len == 0) return null;
+    // Project roots must always be absolute. This prevents file operations from
+    // ever resolving relative to the directory that launched the app.
+    if (path.len == 0 or !std.fs.path.isAbsolute(path)) return null;
     if (model.findProject(path)) |index| {
         addRecentProject(model, path);
         return @intCast(index + 1);
@@ -1241,6 +1243,48 @@ test "recent projects use a ten item MRU" {
     try std.testing.expectEqualStrings("/tmp/recent-2", model.recent_projects[9].path());
 }
 
+test "file tree reads only the selected absolute project root" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(std.testing.io, "nested");
+    try tmp.dir.createDirPath(std.testing.io, ".git");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "inside.txt", .data = "inside" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "nested/child.md", .data = "# Child" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = ".git/ignored.txt", .data = "ignored" });
+
+    var root_storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_storage);
+    const root = root_storage[0..root_len];
+    var output: [64 * 1024]u8 = undefined;
+    const json = try writeProjectTreeJson(std.testing.io, root, &output);
+
+    const Payload = struct {
+        root: []const u8,
+        paths: []const []const u8,
+        truncated: bool,
+        skipped: usize,
+    };
+    const parsed = try std.json.parseFromSlice(Payload, std.testing.allocator, json, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(root, parsed.value.root);
+    try std.testing.expect(!parsed.value.truncated);
+
+    var saw_root_file = false;
+    var saw_nested_file = false;
+    for (parsed.value.paths) |path| {
+        if (std.mem.eql(u8, path, "inside.txt")) saw_root_file = true;
+        if (std.mem.eql(u8, path, "nested/child.md")) saw_nested_file = true;
+        try std.testing.expect(!std.mem.startsWith(u8, path, ".git"));
+        try std.testing.expect(!std.mem.eql(u8, path, "src/main.zig"));
+    }
+    try std.testing.expect(saw_root_file);
+    try std.testing.expect(saw_nested_file);
+
+    var model: Model = .{};
+    try std.testing.expect(addProject(&model, "relative/project") == null);
+    try std.testing.expect(addProject(&model, root) != null);
+}
+
 const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
     native_sdk.security.permission_view,
@@ -1292,8 +1336,7 @@ pub fn appOptions(io: std.Io) DocyrusApp.Options {
     };
 }
 
-const BridgeProjectPath = struct {
-    projectId: u32,
+const BridgePath = struct {
     path: []const u8,
 };
 
@@ -1420,53 +1463,31 @@ const AppHost = struct {
 
     fn validateBridgeProject(self: *AppHost, project_id: u32) !*ProjectState {
         if (project_id == 0 or project_id > self.ui.model.project_count) return error.UnknownProject;
+        if (project_id != self.ui.model.active_project_id) return error.InactiveProject;
         return &self.ui.model.projects[project_id - 1];
+    }
+
+    fn activeBridgeProject(self: *AppHost) !struct { id: u32, project: *ProjectState } {
+        const project_id = self.ui.model.active_project_id;
+        if (project_id == 0 or project_id > self.ui.model.project_count) return error.UnknownProject;
+        return .{ .id = project_id, .project = &self.ui.model.projects[project_id - 1] };
     }
 
     fn listTree(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
         const self: *AppHost = @ptrCast(@alignCast(context));
         if (!std.mem.eql(u8, invocation.source.webview_label, tree_view_label)) return error.InvalidBridgeSource;
-        const Request = struct { projectId: u32 };
-        const parsed = try std.json.parseFromSlice(Request, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
-        defer parsed.deinit();
-        const project = try self.validateBridgeProject(parsed.value.projectId);
-        var directory = try std.Io.Dir.cwd().openDir(self.io, project.path(), .{ .iterate = true });
-        defer directory.close(self.io);
-        var walker = try directory.walk(std.heap.page_allocator);
-        defer walker.deinit();
-        var writer: std.Io.Writer = .fixed(output);
-        try writer.writeByte('[');
-        var count: usize = 0;
-        var first = true;
-        while (count < bridge_tree_limit) {
-            const entry = try walker.next(self.io) orelse break;
-            if (entry.kind == .directory and ignoredDirectory(entry.basename)) {
-                walker.leave(self.io);
-                continue;
-            }
-            if (entry.path.len > relative_path_capacity - 2) continue;
-            if (!first) try writer.writeByte(',');
-            first = false;
-            if (entry.kind == .directory) {
-                var path_buffer: [relative_path_capacity]u8 = undefined;
-                const path = try std.fmt.bufPrint(&path_buffer, "{s}/", .{entry.path});
-                try std.json.Stringify.value(path, .{}, &writer);
-            } else {
-                try std.json.Stringify.value(entry.path, .{}, &writer);
-            }
-            count += 1;
-        }
-        try writer.writeByte(']');
-        return writer.buffered();
+        const active = try self.activeBridgeProject();
+        return writeProjectTreeJson(self.io, active.project.path(), output);
     }
 
     fn openPath(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
         const self: *AppHost = @ptrCast(@alignCast(context));
         if (!std.mem.eql(u8, invocation.source.webview_label, tree_view_label)) return error.InvalidBridgeSource;
-        const parsed = try std.json.parseFromSlice(BridgeProjectPath, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        const parsed = try std.json.parseFromSlice(BridgePath, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         if (!isSafeRelativePath(parsed.value.path) or std.mem.endsWith(u8, parsed.value.path, "/")) return error.InvalidPath;
-        const project = try self.validateBridgeProject(parsed.value.projectId);
+        const active = try self.activeBridgeProject();
+        const project = active.project;
         var absolute_buffer: [2048]u8 = undefined;
         const absolute = try fullPath(project, parsed.value.path, &absolute_buffer);
         var markdown: []u8 = &.{};
@@ -1475,7 +1496,7 @@ const AppHost = struct {
         }
         defer if (markdown.len > 0) std.heap.page_allocator.free(markdown);
         const runtime = self.runtime orelse return error.RuntimeNotReady;
-        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .open_file = .{ .project_id = parsed.value.projectId, .path = parsed.value.path, .markdown = markdown } });
+        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .open_file = .{ .project_id = active.id, .path = parsed.value.path, .markdown = markdown } });
         var writer: std.Io.Writer = .fixed(output);
         try writer.writeAll("true");
         return writer.buffered();
@@ -1530,6 +1551,68 @@ fn ignoredDirectory(name: []const u8) bool {
     const ignored = [_][]const u8{ ".git", ".zig-cache", ".native", "node_modules", "zig-out", ".next", ".turbo" };
     for (ignored) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
+}
+
+fn writeProjectTreeJson(io: std.Io, project_path: []const u8, output: []u8) ![]const u8 {
+    if (!std.fs.path.isAbsolute(project_path)) return error.InvalidProjectPath;
+
+    // Open the selected root explicitly. Never let an empty or relative path
+    // fall through to the process working directory inside an app bundle.
+    var directory = try std.Io.Dir.openDirAbsolute(io, project_path, .{ .iterate = true });
+    defer directory.close(io);
+    var walker = try directory.walkSelectively(std.heap.page_allocator);
+    defer {
+        while (walker.stack.items.len > 1) walker.leave(io);
+        walker.deinit();
+    }
+
+    var writer: std.Io.Writer = .fixed(output);
+    try writer.writeAll("{\"root\":");
+    try std.json.Stringify.value(project_path, .{}, &writer);
+    try writer.writeAll(",\"paths\":[");
+
+    var count: usize = 0;
+    var skipped: usize = 0;
+    var truncated = false;
+    var first = true;
+    while (count < bridge_tree_limit) {
+        const entry = walker.next(io) catch {
+            // An unreadable descendant must not discard files already found in
+            // the selected project. Return the useful partial tree instead.
+            skipped += 1;
+            break;
+        } orelse break;
+
+        if (entry.kind == .directory and ignoredDirectory(entry.basename)) continue;
+        if (entry.path.len > relative_path_capacity - 2) {
+            skipped += 1;
+            continue;
+        }
+
+        if (!first) try writer.writeByte(',');
+        first = false;
+        if (entry.kind == .directory) {
+            var path_buffer: [relative_path_capacity]u8 = undefined;
+            const path = try std.fmt.bufPrint(&path_buffer, "{s}/", .{entry.path});
+            try std.json.Stringify.value(path, .{}, &writer);
+            walker.enter(io, entry) catch {
+                skipped += 1;
+                count += 1;
+                continue;
+            };
+        } else {
+            try std.json.Stringify.value(entry.path, .{}, &writer);
+        }
+        count += 1;
+    }
+    if (count == bridge_tree_limit) truncated = true;
+
+    try writer.writeAll("],\"truncated\":");
+    try writer.writeAll(if (truncated) "true" else "false");
+    try writer.writeAll(",\"skipped\":");
+    try writer.print("{d}", .{skipped});
+    try writer.writeByte('}');
+    return writer.buffered();
 }
 
 fn loadPreferences(model: *Model, io: std.Io, path: []const u8) void {
