@@ -1,0 +1,261 @@
+<!-- Docyrus: native workspace chrome with local Monaco and @pierre/trees WebViews. -->
+<template name="pane-actions" args="pane_id">
+  <row gap="2" cross="center">
+    <button size="sm" variant="ghost" icon="terminal" on-press="open_terminal_in:{pane_id}" label="Open terminal"></button>
+    <button size="sm" variant="ghost" icon="arrow-down" on-press="split_horizontal" label="Split horizontally"></button>
+    <button size="sm" variant="ghost" icon="panel-right" on-press="split_vertical" label="Split vertically"></button>
+  </row>
+</template>
+
+<template name="workspace-tab" args="title tab_id icon_name selected">
+  <panel role="tab" selected="{selected}" on-press="activate_tab:{tab_id}" on-drag="drag_tab:{tab_id}" label="{title}">
+    <row height="30" padding="6" gap="6" cross="center">
+      <icon name="{icon_name}" width="14" height="14" />
+      <text>{title}</text>
+      <button size="sm" variant="ghost" icon="x" on-press="close_tab:{tab_id}" label="Close {title}"></button>
+    </row>
+    <context-menu>
+      <menu-item on-press="close_tab:{tab_id}">Close</menu-item>
+      <menu-item on-press="close_other_tabs:{tab_id}">Close Others</menu-item>
+      <menu-item on-press="close_all_tabs:{tab_id}">Close All</menu-item>
+      <separator />
+      <menu-item on-press="copy_path:{tab_id}">Copy Path</menu-item>
+      <menu-item on-press="copy_relative_path:{tab_id}">Copy Relative Path</menu-item>
+      <separator />
+      <menu-item on-press="reveal_in_finder:{tab_id}">Reveal in Finder</menu-item>
+    </context-menu>
+  </panel>
+</template>
+
+<template name="empty-state" args="pane_id">
+  <column grow="1" main="center" cross="center" gap="16" padding="32" label="Empty workspace">
+    <icon name="file-text" width="40" height="40" foreground="text_muted" />
+    <text size="heading">Start in the File Explorer</text>
+    <text foreground="text_muted" text-alignment="center">Click a code or text file to edit it, a Markdown file to edit and preview it, or an image to preview it.</text>
+    <row gap="8" cross="center">
+      <button variant="secondary" icon="terminal" on-press="open_terminal_in:{pane_id}">Open Terminal</button>
+      <button variant="secondary" icon="arrow-down" on-press="split_horizontal">Split Horizontally</button>
+      <button variant="secondary" icon="panel-right" on-press="split_vertical">Split Vertically</button>
+    </row>
+  </column>
+</template>
+
+<template name="image-preview">
+  <column grow="1" main="center" cross="center" gap="14" padding="28">
+    <if test="{has_preview_image}">
+      <image image="{preview_image}" width="360" height="360" label="Image preview" />
+    </if>
+    <else><text foreground="text_muted">Loading image preview...</text></else>
+    <text size="heading">{preview_image_title}</text>
+  </column>
+</template>
+
+<template name="primary-content">
+  <column grow="1">
+  <if test="{primary_is_markdown_active}">
+    <split grow="1" value="{markdown_fraction}" on-resize="markdown_resized" gap="1">
+      <column min-width="300" grow="1" label="primary-editor-pane"></column>
+      <scroll min-width="280" grow="1" background="surface_subtle">
+        <column padding="24" gap="12"><markdown source="{primary_markdown_body}" /></column>
+      </scroll>
+    </split>
+  </if>
+  <else>
+    <if test="{primary_uses_editor}"><column grow="1" label="primary-editor-pane"></column></if>
+    <else>
+      <if test="{primary_is_image_active}"><use template="image-preview" /></if>
+      <else>
+        <if test="{primary_uses_terminal_one}">
+          <terminal pty="{shell_key}" scrollback="{term_one_scrollback}" on-terminal="term_one_state" autofocus="true" grow="1" focus-ring="background" label="Project terminal one" />
+        </if>
+        <else>
+          <if test="{primary_uses_terminal_two}">
+            <terminal pty="{secondary_shell_key}" scrollback="{term_two_scrollback}" on-terminal="term_two_state" autofocus="true" grow="1" focus-ring="background" label="Project terminal two" />
+          </if>
+        </else>
+      </else>
+    </else>
+  </else>
+  </column>
+</template>
+
+<template name="secondary-content">
+  <column grow="1">
+  <if test="{secondary_is_markdown_active}">
+    <split grow="1" value="{markdown_fraction}" on-resize="markdown_resized" gap="1">
+      <column min-width="260" grow="1" label="secondary-editor-pane"></column>
+      <scroll min-width="240" grow="1" background="surface_subtle">
+        <column padding="20" gap="12"><markdown source="{secondary_markdown_body}" /></column>
+      </scroll>
+    </split>
+  </if>
+  <else>
+    <if test="{secondary_uses_editor}"><column grow="1" label="secondary-editor-pane"></column></if>
+    <else>
+      <if test="{secondary_is_image_active}"><use template="image-preview" /></if>
+      <else>
+        <if test="{secondary_uses_terminal_one}">
+          <terminal pty="{shell_key}" scrollback="{term_one_scrollback}" on-terminal="term_one_state" grow="1" focus-ring="background" label="Project terminal one" />
+        </if>
+        <else>
+          <if test="{secondary_uses_terminal_two}">
+            <terminal pty="{secondary_shell_key}" scrollback="{term_two_scrollback}" on-terminal="term_two_state" grow="1" focus-ring="background" label="Project terminal two" />
+          </if>
+        </else>
+      </else>
+    </else>
+  </else>
+  </column>
+</template>
+
+<template name="primary-pane">
+  <column min-width="320" grow="1" background="background" label="Primary tab panel">
+    <tabs height="40" padding="4" gap="2" background="surface" label="Primary tabs">
+      <for each="primaryTabs" key="id" as="tab">
+        <use template="workspace-tab" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" selected="{tab.selected}" />
+      </for>
+      <spacer grow="1" />
+      <use template="pane-actions" pane_id="1" />
+    </tabs>
+    <separator />
+    <if test="{primary_has_tabs}">
+      <use template="primary-content" />
+      <status-bar>{primary_status_text}</status-bar>
+    </if>
+    <else><use template="empty-state" pane_id="1" /></else>
+  </column>
+</template>
+
+<template name="secondary-pane">
+  <column min-width="280" grow="1" background="background" label="Secondary tab panel">
+    <tabs height="40" padding="4" gap="2" background="surface" label="Secondary tabs">
+      <for each="secondaryTabs" key="id" as="tab">
+        <use template="workspace-tab" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" selected="{tab.selected}" />
+      </for>
+      <spacer grow="1" />
+      <use template="pane-actions" pane_id="2" />
+    </tabs>
+    <separator />
+    <if test="{secondary_has_tabs}">
+      <use template="secondary-content" />
+      <status-bar>{secondary_status_text}</status-bar>
+    </if>
+    <else><use template="empty-state" pane_id="2" /></else>
+  </column>
+</template>
+
+<template name="workspace">
+  <column grow="1" background="background" label="Workspace">
+    <if test="{secondary_panel_open}">
+      <if test="{split_mode == 'vertical'}">
+        <split grow="1" value="{split_fraction}" on-resize="split_resized" gap="1">
+          <use template="primary-pane" />
+          <use template="secondary-pane" />
+        </split>
+      </if>
+      <else>
+        <column grow="1">
+          <use template="primary-pane" />
+          <separator />
+          <use template="secondary-pane" />
+        </column>
+      </else>
+    </if>
+    <else><use template="primary-pane" /></else>
+  </column>
+</template>
+
+<column grow="1" background="background">
+  <row height="42" padding="8" gap="8" cross="center" background="surface" window-drag="true">
+    <row width="64"></row>
+    <button size="sm" variant="ghost" icon="panel-left" on-press="toggle_explorer" label="Toggle Explorer"></button>
+    <text>DOCYRUS</text>
+    <badge variant="secondary">OPEN IDE</badge>
+    <spacer grow="1" />
+    <text foreground="text_muted">{workspace_path}</text>
+    <button size="sm" variant="ghost" icon="settings" on-press="open_settings" label="Settings"></button>
+  </row>
+  <separator />
+
+  <row grow="1">
+    <column width="64" padding="8" gap="8" background="surface_subtle" label="Projects">
+      <button icon="plus" variant="secondary" on-press="open_add_project" label="Add project folder"></button>
+      <separator />
+      <for each="openProjects" key="id" as="project">
+        <button selected="{project.selected}" on-press="select_project:{project.id}" label="{project.path}">{project.initials}</button>
+      </for>
+      <spacer grow="1" />
+    </column>
+    <separator />
+
+    <if test="{explorer_open}">
+      <split grow="1" value="{explorer_fraction}" on-resize="explorer_resized" gap="1">
+        <column min-width="196" max-width="360" background="surface_subtle">
+          <row height="40" padding="10" gap="6" cross="center">
+            <text grow="1">EXPLORER</text>
+            <button size="sm" variant="ghost" icon="refresh-cw" on-press="refresh_files" label="Refresh files"></button>
+            <button size="sm" variant="ghost" icon="panel-left" on-press="toggle_explorer" label="Collapse explorer"></button>
+          </row>
+          <separator />
+          <row height="34" padding="8" gap="6" cross="center" background="surface">
+            <icon name="folder-open" width="15" height="15" />
+            <text grow="1">{project_name}</text>
+          </row>
+          <column grow="1" label="file-tree-pane"></column>
+        </column>
+        <use template="workspace" />
+      </split>
+    </if>
+    <else><use template="workspace" /></else>
+  </row>
+
+  <if test="{add_project_open}">
+    <dialog label="Add project folder" on-dismiss="close_add_project">
+      <column width="560" height="460" padding="24" gap="14">
+        <column gap="6">
+          <text size="heading">Add project folder</text>
+          <text foreground="text_muted" wrap="true">Choose a directory, or reopen one of your recent projects.</text>
+        </column>
+        <button variant="primary" icon="folder" on-press="choose_project_directory">Choose Folder...</button>
+        <separator />
+        <text>RECENT PROJECTS</text>
+        <if test="{has_recent_projects}">
+          <scroll grow="1">
+            <column gap="4">
+              <for each="recentProjects" key="id" as="recent">
+                <panel role="button" on-press="open_recent_project:{recent.id}" label="{recent.path}">
+                  <column padding="6" gap="2" cross="start">
+                    <text>{recent.name}</text>
+                    <text foreground="text_muted">{recent.path}</text>
+                  </column>
+                </panel>
+              </for>
+            </column>
+          </scroll>
+        </if>
+        <else><text foreground="text_muted">No recent projects yet.</text></else>
+        <row main="end"><button variant="ghost" on-press="close_add_project">Cancel</button></row>
+      </column>
+    </dialog>
+  </if>
+
+  <if test="{settings_open}">
+    <dialog label="Settings" on-dismiss="close_settings">
+      <column width="480" height="236" padding="24" gap="18">
+        <column gap="6">
+          <text size="heading">Settings</text>
+          <text foreground="text_muted">Choose how Docyrus Open IDE should appear.</text>
+        </column>
+        <column gap="8">
+          <text>Theme</text>
+          <row gap="6">
+            <button selected="{theme_dark_selected}" on-press="set_theme_dark">Dark Mode</button>
+            <button selected="{theme_light_selected}" on-press="set_theme_light">Light Mode</button>
+            <button selected="{theme_system_selected}" on-press="set_theme_system">System Default</button>
+          </row>
+        </column>
+        <row main="end"><button variant="primary" on-press="close_settings">Done</button></row>
+      </column>
+    </dialog>
+  </if>
+</column>

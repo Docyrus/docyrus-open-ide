@@ -1,0 +1,25 @@
+{
+  "name": "docyrus-open-ide",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A lightweight Native SDK editor with Monaco, Markdown preview, and terminal panes.",
+  "scripts": {
+    "bundle:tree": "esbuild frontend/tree.js --bundle --format=iife --platform=browser --target=safari16 --outfile=frontend/dist/tree.js",
+    "precheck": "npm run bundle:tree",
+    "check": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" native check",
+    "predev": "npm run bundle:tree",
+    "dev": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" native dev",
+    "prebuild": "npm run bundle:tree",
+    "build": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" native build",
+    "test": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" native test"
+  },
+  "dependencies": {
+    "@native-sdk/core": "0.10.1",
+    "@pierre/trees": "^1.0.0-beta.6",
+    "monaco-editor": "0.52.2"
+  },
+  "devDependencies": {
+    "@native-sdk/cli": "0.10.1",
+    "esbuild": "^0.28.2"
+  }
+}

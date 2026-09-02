@@ -1,0 +1,9 @@
+.native/
+zig-out/
+.zig-cache/
+node_modules/
+zig-pkg/
+.DS_Store
+release/
+*.dmg
+*.zip
