@@ -21,6 +21,8 @@ const max_projects: usize = 10;
 const max_recent_projects: usize = 10;
 const max_tabs: usize = 10;
 const max_file_tabs: usize = 8;
+const max_external_files: usize = 64;
+const max_pending_open_files: usize = 16;
 const project_path_capacity: usize = 1024;
 const relative_path_capacity: usize = 768;
 const title_capacity: usize = 160;
@@ -40,6 +42,10 @@ const Pane = enum(u8) { primary = 1, secondary = 2 };
 const SplitMode = enum { horizontal, vertical };
 const ThemeMode = enum(u8) { system = 0, light = 1, dark = 2 };
 const FileKind = enum(u8) { code, markdown, image, text };
+const ProjectKind = enum(u8) { folder, external_files };
+
+const system_open_view_label = "__docyrus_open_files__";
+const other_open_files_name = "Other Open Files";
 
 pub const TabView = struct {
     id: u32,
@@ -95,6 +101,11 @@ const EditorDirtyMessage = struct {
     dirty: bool,
 };
 
+const SystemOpenFileMessage = struct {
+    path: []const u8,
+    markdown: []const u8 = "",
+};
+
 const CloseIntent = enum(u8) { none, single, others, all };
 const EditorAction = enum(u8) { none, save_and_close, discard_and_close };
 
@@ -104,7 +115,7 @@ const FileTab = struct {
     kind: FileKind = .text,
     markdown_editor_visible: bool = true,
     markdown_preview_visible: bool = true,
-    path_buffer: [relative_path_capacity]u8 = undefined,
+    path_buffer: [project_path_capacity]u8 = undefined,
     path_len: usize = 0,
     title_buffer: [title_capacity]u8 = undefined,
     title_len: usize = 0,
@@ -162,7 +173,30 @@ const LayoutState = struct {
     term_two_live: bool = false,
 };
 
+const ExternalFile = struct {
+    path_buffer: [project_path_capacity]u8 = undefined,
+    path_len: usize = 0,
+    tree_name_buffer: [title_capacity]u8 = undefined,
+    tree_name_len: usize = 0,
+
+    fn path(self: *const ExternalFile) []const u8 {
+        return self.path_buffer[0..self.path_len];
+    }
+
+    fn treeName(self: *const ExternalFile) []const u8 {
+        return self.tree_name_buffer[0..self.tree_name_len];
+    }
+
+    fn set(self: *ExternalFile, value: []const u8, tree_name: []const u8) void {
+        self.path_len = @min(value.len, self.path_buffer.len);
+        @memcpy(self.path_buffer[0..self.path_len], value[0..self.path_len]);
+        self.tree_name_len = @min(tree_name.len, self.tree_name_buffer.len);
+        @memcpy(self.tree_name_buffer[0..self.tree_name_len], tree_name[0..self.tree_name_len]);
+    }
+};
+
 const ProjectState = struct {
+    kind: ProjectKind = .folder,
     path_buffer: [project_path_capacity]u8 = undefined,
     path_len: usize = 0,
     name_buffer: [title_capacity]u8 = undefined,
@@ -179,7 +213,8 @@ const ProjectState = struct {
     }
 
     fn displayName(self: *const ProjectState) []const u8 {
-        return if (self.name_len > 0) self.name_buffer[0..self.name_len] else projectName(self.path());
+        if (self.name_len > 0) return self.name_buffer[0..self.name_len];
+        return if (self.kind == .external_files) other_open_files_name else projectName(self.path());
     }
 
     fn setDisplayName(self: *ProjectState, value: []const u8) void {
@@ -221,6 +256,8 @@ pub const Model = struct {
         "project_order",
         "recent_projects",
         "recent_count",
+        "external_files",
+        "external_file_count",
         "theme_mode",
         "home_path_buffer",
         "home_path_len",
@@ -265,6 +302,8 @@ pub const Model = struct {
     active_project_id: u32 = 0,
     recent_projects: [max_recent_projects]RecentProject = [_]RecentProject{.{}} ** max_recent_projects,
     recent_count: u8 = 0,
+    external_files: [max_external_files]ExternalFile = [_]ExternalFile{.{}} ** max_external_files,
+    external_file_count: u8 = 0,
     theme_mode: ThemeMode = .system,
     project_sidebar_fraction: f32 = 200.0 / window_width,
     home_path_buffer: [project_path_capacity]u8 = undefined,
@@ -372,6 +411,10 @@ pub const Model = struct {
             if (model.findProject(recent.path()) == null) return true;
         }
         return false;
+    }
+
+    pub fn has_projects(model: *const Model) bool {
+        return model.project_count > 0;
     }
 
     pub fn workspace_path(model: *const Model) []const u8 {
@@ -570,7 +613,14 @@ pub const Model = struct {
 
     fn findProject(model: *const Model, path: []const u8) ?usize {
         for (model.projects[0..model.project_count], 0..) |*project, index| {
-            if (std.mem.eql(u8, project.path(), path)) return index;
+            if (project.kind == .folder and std.mem.eql(u8, project.path(), path)) return index;
+        }
+        return null;
+    }
+
+    fn findExternalProject(model: *const Model) ?usize {
+        for (model.projects[0..model.project_count], 0..) |*project, index| {
+            if (project.kind == .external_files) return index;
         }
         return null;
     }
@@ -584,6 +634,7 @@ pub const Msg = union(enum) {
         "directory_selected",
         "directory_picker_cancelled",
         "open_file",
+        "open_system_file",
         "markdown_saved",
         "editor_dirty_changed",
         "editor_discarded",
@@ -646,6 +697,7 @@ pub const Msg = union(enum) {
     toggle_markdown_editor: u32,
     toggle_markdown_preview: u32,
     open_file: OpenFileMessage,
+    open_system_file: SystemOpenFileMessage,
     markdown_saved: MarkdownSavedMessage,
     editor_dirty_changed: EditorDirtyMessage,
     editor_discarded,
@@ -871,6 +923,86 @@ fn addProject(model: *Model, raw_path: []const u8) ?u32 {
     return @intCast(index + 1);
 }
 
+fn ensureExternalProject(model: *Model) ?u32 {
+    if (model.findExternalProject()) |index| return @intCast(index + 1);
+    if (model.project_count >= max_projects) return null;
+    const index: usize = model.project_count;
+    model.projects[index] = .{ .kind = .external_files };
+    model.projects[index].setDisplayName(other_open_files_name);
+    model.project_count += 1;
+    model.project_order[index] = @intCast(index + 1);
+    return @intCast(index + 1);
+}
+
+fn pathIsInsideProject(file_path: []const u8, project_path: []const u8) bool {
+    if (!std.mem.startsWith(u8, file_path, project_path) or file_path.len <= project_path.len) return false;
+    return file_path[project_path.len] == '/' or file_path[project_path.len] == '\\';
+}
+
+fn projectContainingFile(model: *const Model, file_path: []const u8) ?u32 {
+    var best_id: ?u32 = null;
+    var best_length: usize = 0;
+    for (model.projects[0..model.project_count], 0..) |*project, index| {
+        if (project.kind != .folder or project.path().len <= best_length) continue;
+        if (pathIsInsideProject(file_path, project.path())) {
+            best_id = @intCast(index + 1);
+            best_length = project.path().len;
+        }
+    }
+    return best_id;
+}
+
+fn externalFileIndex(model: *const Model, path: []const u8) ?usize {
+    for (model.external_files[0..model.external_file_count], 0..) |*file, index| {
+        if (std.mem.eql(u8, file.path(), path)) return index;
+    }
+    return null;
+}
+
+fn externalFileForTreeName(model: *const Model, tree_name: []const u8) ?*const ExternalFile {
+    for (model.external_files[0..model.external_file_count]) |*file| {
+        if (std.mem.eql(u8, file.treeName(), tree_name)) return file;
+    }
+    return null;
+}
+
+fn addExternalFile(model: *Model, path: []const u8) ?usize {
+    if (externalFileIndex(model, path)) |index| return index;
+    if (model.external_file_count >= max_external_files) return null;
+    const basename = std.fs.path.basename(path);
+    var name_buffer: [title_capacity]u8 = undefined;
+    var tree_name: []const u8 = basename;
+    var suffix: usize = 2;
+    while (externalFileForTreeName(model, tree_name) != null) : (suffix += 1) {
+        tree_name = std.fmt.bufPrint(&name_buffer, "{s} ({d})", .{ basename, suffix }) catch return null;
+    }
+    const index: usize = model.external_file_count;
+    model.external_files[index].set(path, tree_name);
+    model.external_file_count += 1;
+    return index;
+}
+
+fn openSystemFile(model: *Model, message: SystemOpenFileMessage, fx: *Effects) void {
+    if (!std.fs.path.isAbsolute(message.path) or std.mem.indexOfScalar(u8, message.path, 0) != null) return;
+    if (projectContainingFile(model, message.path)) |project_id| {
+        model.add_project_open = false;
+        model.directory_picker_requested = false;
+        const project = &model.projects[project_id - 1];
+        const relative = message.path[project.path().len + 1 ..];
+        if (model.active_project_id != project_id) selectProject(model, project_id);
+        openFile(model, .{ .project_id = project_id, .path = relative, .markdown = message.markdown }, fx);
+        return;
+    }
+
+    const project_id = ensureExternalProject(model) orelse return;
+    _ = addExternalFile(model, message.path) orelse return;
+    model.add_project_open = false;
+    model.directory_picker_requested = false;
+    if (model.active_project_id != project_id) selectProject(model, project_id);
+    model.tree_reload_token +%= 1;
+    openFile(model, .{ .project_id = project_id, .path = message.path, .markdown = message.markdown }, fx);
+}
+
 fn selectProject(model: *Model, project_id: u32) void {
     if (project_id == 0 or project_id > model.project_count or project_id == model.active_project_id) return;
     model.active_project_id = project_id;
@@ -929,6 +1061,10 @@ fn closeProject(model: *Model, project_id: u32, forget: bool, fx: *Effects) void
     const name_len = @min(name.len, name_copy.len);
     @memcpy(name_copy[0..name_len], name[0..name_len]);
 
+    if (model.projects[project_index].kind == .external_files) {
+        model.external_files = [_]ExternalFile{.{}} ** max_external_files;
+        model.external_file_count = 0;
+    }
     if (forget) removeRecentProject(model, path_copy[0..path_len]) else addRecentProjectNamed(model, path_copy[0..path_len], name_copy[0..name_len]);
 
     // Project IDs are used as PTY keys. Stop every affected slot before the
@@ -960,6 +1096,7 @@ fn closeProject(model: *Model, project_id: u32, forget: bool, fx: *Effects) void
     const old_active = model.active_project_id;
     if (model.project_count == 0) {
         model.active_project_id = 0;
+        model.add_project_open = true;
     } else if (old_active == project_id) {
         model.active_project_id = @min(project_id, model.project_count);
     } else if (old_active > project_id) {
@@ -1093,7 +1230,11 @@ fn activateTab(model: *Model, id: u32, fx: *Effects) void {
 }
 
 fn openFile(model: *Model, message: OpenFileMessage, fx: *Effects) void {
-    if (message.project_id != model.active_project_id or !isSafeRelativePath(message.path)) return;
+    if (message.project_id != model.active_project_id) return;
+    const project = model.activeProjectConst() orelse return;
+    if (project.kind == .folder) {
+        if (!isSafeRelativePath(message.path)) return;
+    } else if (!std.fs.path.isAbsolute(message.path) or externalFileIndex(model, message.path) == null) return;
     const layout = model.activeLayout() orelse return;
     const slot = findFileSlot(layout, message.path) orelse availableFileSlot(layout) orelse return;
     if (!layout.file_tabs[slot].used) layout.file_tabs[slot].setPath(message.path);
@@ -1364,6 +1505,10 @@ fn isSafeRelativePath(path: []const u8) bool {
 }
 
 fn fullPath(project: *const ProjectState, relative: []const u8, output: []u8) ![]const u8 {
+    if (project.kind == .external_files) {
+        if (!std.fs.path.isAbsolute(relative)) return error.InvalidPath;
+        return relative;
+    }
     if (!isSafeRelativePath(relative)) return error.InvalidPath;
     return std.fmt.bufPrint(output, "{s}/{s}", .{ project.path(), relative });
 }
@@ -1379,10 +1524,12 @@ fn fullPathForTab(model: *Model, id: u32) []const u8 {
 }
 
 fn relativePathForTab(model: *const Model, id: u32) []const u8 {
-    const layout = model.activeLayoutConst() orelse return "";
+    const project = model.activeProjectConst() orelse return "";
+    const layout = &project.layout;
     if (id == 9 or id == 10) return ".";
     if (id < 1 or id > max_file_tabs or !layout.file_tabs[id - 1].used) return "";
-    return layout.file_tabs[id - 1].path();
+    const path = layout.file_tabs[id - 1].path();
+    return if (project.kind == .external_files) std.fs.path.basename(path) else path;
 }
 
 fn copyTabPath(model: *Model, id: u32, absolute: bool, fx: *Effects) void {
@@ -1403,6 +1550,11 @@ fn ensureImage(model: *Model, id: u32, fx: *Effects) void {
 }
 
 fn shellArgv(project: *const ProjectState, storage: *[5][]const u8) []const []const u8 {
+    if (project.kind == .external_files) {
+        if (builtin.os.tag == .macos) return &.{ "/bin/zsh", "-i" };
+        if (builtin.os.tag == .windows) return &.{"cmd.exe"};
+        return &.{ "/bin/sh", "-i" };
+    }
     if (builtin.os.tag == .macos) {
         storage.* = .{ "/bin/zsh", "-lc", "cd -- \"$1\" && exec /bin/zsh -i", "docyrus", project.path() };
         return storage;
@@ -1554,8 +1706,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.add_project_open = true;
         },
         .close_add_project => {
-            model.add_project_open = false;
-            model.directory_picker_requested = false;
+            // With no project there is no useful workspace behind this
+            // chooser. Keep it modal until a folder or external file opens.
+            if (model.project_count > 0) {
+                model.add_project_open = false;
+                model.directory_picker_requested = false;
+            }
         },
         .choose_project_directory => model.directory_picker_requested = true,
         .open_recent_project => |recent_id| {
@@ -1604,6 +1760,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .toggle_markdown_editor => |pane_id| toggleMarkdownSurface(model, pane_id, true),
         .toggle_markdown_preview => |pane_id| toggleMarkdownSurface(model, pane_id, false),
         .open_file => |message| openFile(model, message, fx),
+        .open_system_file => |message| openSystemFile(model, message, fx),
         .markdown_saved => |message| {
             if (message.project_id == model.active_project_id) {
                 const layout = model.activeLayout() orelse return;
@@ -1696,6 +1853,51 @@ test "each project owns an independent empty layout" {
     update(&model, .finish_project_switch, &fx);
     try std.testing.expectEqual(@as(u8, 1), model.projects[0].layout.primary_tab_count);
     try std.testing.expectEqualStrings("# One", model.primary_markdown_body());
+}
+
+test "system-opened files route to their owning project or Other Open Files" {
+    var model: Model = .{};
+    const folder_id = addProject(&model, "/tmp/workspace").?;
+    model.active_project_id = folder_id;
+    syncUrls(&model);
+    var fx: Effects = undefined;
+
+    openSystemFile(&model, .{ .path = "/tmp/workspace/src/main.zig" }, &fx);
+    try std.testing.expectEqual(folder_id, model.active_project_id);
+    try std.testing.expectEqual(@as(u8, 1), model.project_count);
+    try std.testing.expectEqualStrings("src/main.zig", model.projects[0].layout.file_tabs[0].path());
+
+    openSystemFile(&model, .{ .path = "/tmp/unrelated/notes.txt" }, &fx);
+    try std.testing.expectEqual(@as(u8, 2), model.project_count);
+    try std.testing.expectEqual(@as(u32, 2), model.active_project_id);
+    const external = &model.projects[1];
+    try std.testing.expectEqual(ProjectKind.external_files, external.kind);
+    try std.testing.expectEqualStrings("", external.path());
+    try std.testing.expectEqualStrings(other_open_files_name, external.displayName());
+    try std.testing.expectEqual(@as(u8, 1), model.external_file_count);
+    try std.testing.expectEqualStrings("/tmp/unrelated/notes.txt", external.layout.file_tabs[0].path());
+    try std.testing.expectEqualStrings("notes.txt", relativePathForTab(&model, 1));
+}
+
+test "Other Open Files tree keeps directly opened files after tabs close" {
+    var model: Model = .{};
+    var fx: Effects = undefined;
+    openSystemFile(&model, .{ .path = "/tmp/one/shared.txt" }, &fx);
+    openSystemFile(&model, .{ .path = "/tmp/two/shared.txt" }, &fx);
+    const external = &model.projects[0];
+    try std.testing.expectEqual(@as(u8, 2), model.external_file_count);
+    try std.testing.expectEqualStrings("shared.txt", model.external_files[0].treeName());
+    try std.testing.expectEqualStrings("shared.txt (2)", model.external_files[1].treeName());
+
+    closeTabNow(&model, 1);
+    closeTabNow(&model, 2);
+    try std.testing.expectEqual(@as(u8, 0), external.layout.primary_tab_count);
+
+    var output: [4096]u8 = undefined;
+    const json = try writeExternalTreeJson(&model, 0, &output);
+    try std.testing.expect(std.mem.indexOf(u8, json, "Other Open Files") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "shared.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "shared.txt (2)") != null);
 }
 
 test "tab dragging mutates only when the drop completes" {
@@ -1796,10 +1998,35 @@ test "closing keeps a project recent while removing forgets it" {
 
     closeProject(&model, 1, true, &fx);
     try std.testing.expectEqual(@as(u8, 0), model.project_count);
+    try std.testing.expect(model.add_project_open);
     try std.testing.expect(model.findProject("/tmp/second") == null);
     for (model.recent_projects[0..model.recent_count]) |*recent| {
         try std.testing.expect(!std.mem.eql(u8, recent.path(), "/tmp/second"));
     }
+}
+
+test "empty workspace keeps the project chooser open until a project exists" {
+    var model: Model = .{ .add_project_open = true };
+    var fx: Effects = undefined;
+
+    try std.testing.expect(!model.has_projects());
+    update(&model, .close_add_project, &fx);
+    try std.testing.expect(model.add_project_open);
+
+    update(&model, .{ .directory_selected = "/tmp/project" }, &fx);
+    try std.testing.expect(model.has_projects());
+    try std.testing.expect(!model.add_project_open);
+}
+
+test "opening an external file dismisses the required project chooser" {
+    var model: Model = .{ .add_project_open = true };
+    var fx: Effects = undefined;
+
+    openSystemFile(&model, .{ .path = "/tmp/outside.py" }, &fx);
+
+    try std.testing.expect(model.has_projects());
+    try std.testing.expect(!model.add_project_open);
+    try std.testing.expectEqualStrings(other_open_files_name, model.project_name());
 }
 
 test "dirty file tabs require confirmation and save before closing" {
@@ -2067,6 +2294,17 @@ const AppHost = struct {
     runtime: ?*native_sdk.Runtime = null,
     preferences_path: [1024]u8 = undefined,
     preferences_path_len: usize = 0,
+    pending_open_files: [max_pending_open_files]ExternalFile = [_]ExternalFile{.{}} ** max_pending_open_files,
+    pending_open_file_count: u8 = 0,
+
+    fn queueOpenFile(self: *AppHost, path: []const u8) void {
+        if (!std.fs.path.isAbsolute(path) or path.len > project_path_capacity or self.pending_open_file_count >= max_pending_open_files) return;
+        for (self.pending_open_files[0..self.pending_open_file_count]) |*pending| {
+            if (std.mem.eql(u8, pending.path(), path)) return;
+        }
+        self.pending_open_files[self.pending_open_file_count].set(path, "");
+        self.pending_open_file_count += 1;
+    }
 
     fn app(self: *AppHost) native_sdk.App {
         return .{
@@ -2088,13 +2326,34 @@ const AppHost = struct {
             std.log.err("base UI start failed: {s}", .{@errorName(err)});
             return err;
         };
+        for (self.pending_open_files[0..self.pending_open_file_count]) |*pending| {
+            try self.dispatchSystemOpen(runtime, 1, pending.path());
+        }
+        self.pending_open_file_count = 0;
     }
 
     fn eventFn(context: *anyopaque, runtime: *native_sdk.Runtime, event: native_sdk.Event) anyerror!void {
         const self: *AppHost = @ptrCast(@alignCast(context));
         try self.base.event(runtime, event);
+        switch (event) {
+            .files_dropped => |drop| if (std.mem.eql(u8, drop.view_label, system_open_view_label)) {
+                for (drop.paths) |path| try self.dispatchSystemOpen(runtime, drop.window_id, path);
+            },
+            else => {},
+        }
         if (self.ui.model.directory_picker_requested) try self.showDirectoryPicker(runtime);
         if (self.ui.model.project_switching) try self.ui.dispatch(runtime, 1, .finish_project_switch);
+    }
+
+    fn dispatchSystemOpen(self: *AppHost, runtime: *native_sdk.Runtime, window_id: u64, path: []const u8) !void {
+        if (!std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null) return;
+        var markdown: []u8 = &.{};
+        if (fileKind(path) == .markdown) {
+            markdown = std.Io.Dir.cwd().readFileAlloc(self.io, path, std.heap.page_allocator, .limited(markdown_capacity)) catch &.{};
+        }
+        defer if (markdown.len > 0) std.heap.page_allocator.free(markdown);
+        try self.ui.dispatch(runtime, window_id, .{ .open_system_file = .{ .path = path, .markdown = markdown } });
+        if (self.ui.model.project_switching) try self.ui.dispatch(runtime, window_id, .finish_project_switch);
     }
 
     fn sceneFn(context: *anyopaque) anyerror!native_sdk.ShellConfig {
@@ -2164,6 +2423,7 @@ const AppHost = struct {
         const parsed = try std.json.parseFromSlice(BridgeTreePage, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const active = try self.activeBridgeProject();
+        if (active.project.kind == .external_files) return writeExternalTreeJson(&self.ui.model, parsed.value.offset, output);
         return writeProjectTreeJson(self.io, active.project.path(), parsed.value.offset, output);
     }
 
@@ -2176,14 +2436,18 @@ const AppHost = struct {
         const active = try self.activeBridgeProject();
         const project = active.project;
         var absolute_buffer: [2048]u8 = undefined;
-        const absolute = try fullPath(project, parsed.value.path, &absolute_buffer);
+        const open_path = if (project.kind == .external_files)
+            (externalFileForTreeName(&self.ui.model, parsed.value.path) orelse return error.InvalidPath).path()
+        else
+            parsed.value.path;
+        const absolute = try fullPath(project, open_path, &absolute_buffer);
         var markdown: []u8 = &.{};
-        if (fileKind(parsed.value.path) == .markdown) {
+        if (fileKind(open_path) == .markdown) {
             markdown = std.Io.Dir.cwd().readFileAlloc(self.io, absolute, std.heap.page_allocator, .limited(markdown_capacity)) catch &.{};
         }
         defer if (markdown.len > 0) std.heap.page_allocator.free(markdown);
         const runtime = self.runtime orelse return error.RuntimeNotReady;
-        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .open_file = .{ .project_id = active.id, .path = parsed.value.path, .markdown = markdown } });
+        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .open_file = .{ .project_id = active.id, .path = open_path, .markdown = markdown } });
         var writer: std.Io.Writer = .fixed(output);
         try writer.writeAll("true");
         return writer.buffered();
@@ -2314,6 +2578,28 @@ fn ignoredDirectory(name: []const u8) bool {
 const BridgeTreePage = struct {
     offset: usize = 0,
 };
+
+fn writeExternalTreeJson(model: *const Model, offset: usize, output: []u8) ![]const u8 {
+    const count: usize = model.external_file_count;
+    if (offset > count) return error.InvalidTreeOffset;
+    var writer: std.Io.Writer = .fixed(output);
+    try writer.writeAll("{\"root\":");
+    try std.json.Stringify.value(other_open_files_name, .{}, &writer);
+    try writer.writeAll(",\"paths\":[");
+    var first = true;
+    var index = offset;
+    while (index < count and index - offset < bridge_tree_page_limit) : (index += 1) {
+        if (!first) try writer.writeByte(',');
+        first = false;
+        try std.json.Stringify.value(model.external_files[index].treeName(), .{}, &writer);
+    }
+    try writer.writeAll("],\"nextOffset\":");
+    try writer.print("{d}", .{index});
+    try writer.writeAll(",\"done\":");
+    try writer.writeAll(if (index >= count) "true" else "false");
+    try writer.writeAll(",\"truncated\":false,\"skipped\":0}");
+    return writer.buffered();
+}
 
 fn writeProjectTreeJson(io: std.Io, project_path: []const u8, offset: usize, output: []u8) ![]const u8 {
     if (!std.fs.path.isAbsolute(project_path)) return error.InvalidProjectPath;
@@ -2459,6 +2745,7 @@ pub fn main(init: std.process.Init) !void {
         initial_model.active_project_id = addProject(&initial_model, path) orelse 0;
     }
     if (init.environ_map.get("DOCYRUS_OPEN_IDE_E2E_RECENT")) |path| addRecentProject(&initial_model, path);
+    initial_model.add_project_open = initial_model.project_count == 0;
     syncUrls(&initial_model);
 
     const app_state = try std.heap.page_allocator.create(DocyrusApp);
@@ -2478,6 +2765,11 @@ pub fn main(init: std.process.Init) !void {
         host.preferences_path_len = path.len;
         @memcpy(host.preferences_path[0..path.len], path);
     }
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len > 1) {
+        for (args[1..]) |argument| host.queueOpenFile(argument);
+    }
+    if (init.environ_map.get("DOCYRUS_OPEN_IDE_E2E_OPEN_FILE")) |path| host.queueOpenFile(path);
     const app = host.app();
 
     const bridge_policies = [_]native_sdk.bridge.CommandPolicy{

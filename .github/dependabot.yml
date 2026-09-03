@@ -7,8 +7,8 @@ updates:
     open-pull-requests-limit: 5
     reviewers:
       - Docyrus/system
-    # The SDK is patched by scripts/patch-native-sdk-pointer.mjs and Monaco is
-    # vendored under frontend/dist/vs, so both need a human upgrade, not a bump.
+    # The SDK is patched by the scripts/patch-native-sdk-*.mjs files and Monaco
+    # is vendored under frontend/dist/vs, so both need a human upgrade, not a bump.
     ignore:
       - dependency-name: "@native-sdk/cli"
       - dependency-name: "@native-sdk/core"

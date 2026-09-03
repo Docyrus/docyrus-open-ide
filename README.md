@@ -22,6 +22,7 @@ The installer places `Docyrus Open IDE.app` in `/Applications`, clears the downl
 - Keep a completely independent pane layout, tabs, split mode, explorer state, and terminal pair for each open project.
 - Reorder tabs or move them between panes with drag and drop.
 - Edit local code, text, and Markdown files in Monaco; Markdown updates its native preview after save.
+- Open code and text documents from Finder's Open With menu. Files outside an added project are collected in the pathless Other Open Files workspace.
 - Preview local images with the Native SDK Image component.
 - Choose Dark Mode, Light Mode, or System Default in Settings.
 
