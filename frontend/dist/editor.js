@@ -70,8 +70,14 @@ require(["vs/editor/editor.main"], async () => {
   try {
     if (!projectId || !slot) throw new Error("No file selected");
     const file = await invoke("workspace.readFile", { projectId, slot });
+    const draftKey = `docyrus:unsaved:${file.path}`;
+    let draft = null;
+    try {
+      draft = window.localStorage.getItem(draftKey);
+    } catch {}
+    let savedContent = file.content;
     const editor = monaco.editor.create(document.querySelector("#editor"), {
-      value: file.content,
+      value: draft ?? file.content,
       language: languageFor(file.relativePath),
       theme: resolvedTheme() === "dark" ? "vs-dark" : "vs",
       automaticLayout: true,
@@ -92,34 +98,90 @@ require(["vs/editor/editor.main"], async () => {
     loading.remove();
     editor.focus();
 
-    let saveTimer;
-    let savedVersion = editor.getModel().getAlternativeVersionId();
-    const save = async () => {
-      window.clearTimeout(saveTimer);
-      const version = editor.getModel().getAlternativeVersionId();
-      if (version === savedVersion) return;
+    let lastReportedDirty = null;
+    let actionInFlight = false;
+
+    function persistDraft(content, dirty) {
+      try {
+        if (dirty) window.localStorage.setItem(draftKey, content);
+        else window.localStorage.removeItem(draftKey);
+      } catch {
+        status.textContent = "Could not store the unsaved draft";
+      }
+    }
+
+    async function reportDirty(dirty) {
+      if (dirty === lastReportedDirty) return;
+      lastReportedDirty = dirty;
+      try {
+        await invoke("workspace.editorDirty", { projectId, slot, dirty });
+      } catch {
+        lastReportedDirty = null;
+      }
+    }
+
+    function syncDirtyState() {
+      const content = editor.getValue();
+      const dirty = content !== savedContent;
+      persistDraft(content, dirty);
+      status.textContent = dirty ? "Unsaved" : "";
+      void reportDirty(dirty);
+      return dirty;
+    }
+
+    const save = async (closeAfterSave = false, force = false) => {
+      const content = editor.getValue();
+      if (!force && content === savedContent) return true;
       status.textContent = "Saving…";
       try {
-        await invoke("workspace.writeFile", { projectId, slot, content: editor.getValue() });
-        savedVersion = version;
+        await invoke("workspace.writeFile", { projectId, slot, content, closeAfterSave });
+        savedContent = content;
+        const stillDirty = editor.getValue() !== savedContent;
+        persistDraft(editor.getValue(), stillDirty);
+        await reportDirty(stillDirty);
         status.textContent = "Saved";
         window.setTimeout(() => {
           if (status.textContent === "Saved") status.textContent = "";
         }, 900);
+        return true;
       } catch (error) {
         status.textContent = error instanceof Error ? error.message : "Save failed";
+        return false;
       }
     };
-    editor.onDidChangeModelContent(() => {
-      window.clearTimeout(saveTimer);
-      saveTimer = window.setTimeout(save, 500);
-    });
+    editor.onDidChangeModelContent(syncDirtyState);
     editor.addAction({
       id: "docyrus.save",
       label: "Save",
       keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
-      run: save,
+      run: () => save(),
     });
+
+    syncDirtyState();
+    const actionTimer = window.setInterval(async () => {
+      if (actionInFlight) return;
+      try {
+        const action = await invoke("workspace.editorAction", { projectId, slot });
+        if (action === "none") return;
+        actionInFlight = true;
+        if (action === "saveAndClose") {
+          if (!await save(true, true)) await invoke("workspace.editorActionFailed", { projectId, slot });
+        } else if (action === "discardAndClose") {
+          persistDraft("", false);
+          await invoke("workspace.discardAndClose", { projectId, slot });
+        }
+      } catch {
+        try {
+          await invoke("workspace.editorActionFailed", { projectId, slot });
+        } catch {}
+      } finally {
+        actionInFlight = false;
+      }
+    }, 250);
+    window.addEventListener("beforeunload", () => {
+      window.clearInterval(actionTimer);
+      syncDirtyState();
+    }, { once: true });
   } catch (error) {
     loading.textContent = error instanceof Error ? error.message : "Could not open this file";
   }
