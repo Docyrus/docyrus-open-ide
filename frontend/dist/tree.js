@@ -9184,14 +9184,30 @@
   async function renderTree() {
     status.textContent = "Loading project files\u2026";
     try {
-      const result = await invoke("workspace.listTree", {});
-      const paths = Array.isArray(result) ? result : result?.paths;
-      const root = Array.isArray(result) ? "" : result?.root;
-      const skipped = Array.isArray(result) ? 0 : Number(result?.skipped || 0);
-      const truncated = Array.isArray(result) ? false : Boolean(result?.truncated);
-      if (!Array.isArray(paths) || typeof root !== "string") {
-        throw new Error("The active project returned an invalid file list");
+      const paths = [];
+      let root = "";
+      let offset = 0;
+      let skipped = 0;
+      let truncated = false;
+      while (true) {
+        const result = await invoke("workspace.listTree", { offset });
+        const pagePaths = Array.isArray(result) ? result : result?.paths;
+        const pageRoot = Array.isArray(result) ? "" : result?.root;
+        if (!Array.isArray(pagePaths) || typeof pageRoot !== "string") {
+          throw new Error("The active project returned an invalid file list");
+        }
+        if (offset === 0) root = pageRoot;
+        paths.push(...pagePaths);
+        skipped = Math.max(skipped, Number(result?.skipped || 0));
+        truncated ||= Boolean(result?.truncated);
+        if (Array.isArray(result) || result?.done) break;
+        const nextOffset = Number(result?.nextOffset);
+        if (!Number.isSafeInteger(nextOffset) || nextOffset <= offset) {
+          throw new Error("The active project returned an invalid file-list cursor");
+        }
+        offset = nextOffset;
       }
+      mount.textContent = "";
       tree = new FileTree({
         id: `workspace-files-${projectId}`,
         paths: Array.isArray(paths) ? paths : [],

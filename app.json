@@ -4,7 +4,7 @@
     "name": "docyrus-open-ide",
     "display_name": "Docyrus Open IDE",
     "description": "A lightweight native workspace for code, Markdown, and terminal sessions.",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "icons": ["assets/docyrus-open-ide-icon.png"],
     "platforms": ["macos"],
     "permissions": ["view", "command", "clipboard", "filesystem"],
@@ -34,7 +34,10 @@
                 "restore_state": true,
                 "titlebar": "hidden_inset",
                 "views": [
-                    { "label": "docyrus-canvas", "kind": "gpu_surface", "fill": true, "role": "Docyrus workspace", "accessibility_label": "Docyrus Open IDE", "gpu_backend": "metal", "gpu_pixel_format": "bgra8_unorm", "gpu_present_mode": "timer", "gpu_alpha_mode": "opaque", "gpu_color_space": "srgb", "gpu_vsync": true }
+                    { "label": "docyrus-canvas", "kind": "gpu_surface", "fill": true, "role": "Docyrus workspace", "accessibility_label": "Docyrus Open IDE", "gpu_backend": "metal", "gpu_pixel_format": "bgra8_unorm", "gpu_present_mode": "timer", "gpu_alpha_mode": "opaque", "gpu_color_space": "srgb", "gpu_vsync": true },
+                    { "label": "docyrus-monaco-primary", "kind": "webview", "parent": "docyrus-canvas", "x": 0, "y": 0, "width": 1, "height": 1, "layer": 20, "url": "zero://app/index.html?project=0&slot=0&theme=system" },
+                    { "label": "docyrus-monaco-secondary", "kind": "webview", "parent": "docyrus-canvas", "x": 0, "y": 0, "width": 1, "height": 1, "layer": 20, "url": "zero://app/index.html?project=0&slot=0&theme=system" },
+                    { "label": "docyrus-file-tree", "kind": "webview", "parent": "docyrus-canvas", "x": 0, "y": 0, "width": 1, "height": 1, "layer": 18, "url": "zero://app/tree.html?project=0&theme=system" }
                 ]
             }
         ]

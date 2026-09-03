@@ -27,6 +27,10 @@ const title_capacity: usize = 160;
 const markdown_capacity: usize = 32 * 1024;
 const bridge_file_limit: usize = 768 * 1024;
 const bridge_tree_limit: usize = 1200;
+const bridge_tree_page_limit: usize = 160;
+// Bridge handler results are capped at 12 KiB. Leave room for the response
+// envelope and JSON metadata so a large project cannot fail as one payload.
+const bridge_tree_page_budget: usize = 9 * 1024;
 const clipboard_effect_key_start: u64 = 100;
 
 pub const window_width: f32 = 1440;
@@ -195,7 +199,6 @@ pub const Model = struct {
         "preview_image_path",
         "preview_image_path_len",
         "clipboard_key",
-        "webviews_ready",
         "primaryEditorUrl",
         "secondaryEditorUrl",
         "treeUrl",
@@ -228,7 +231,6 @@ pub const Model = struct {
     preview_image_path: [2048]u8 = undefined,
     preview_image_path_len: usize = 0,
     clipboard_key: u64 = clipboard_effect_key_start,
-    webviews_ready: bool = false,
 
     fn activeProject(model: *Model) ?*ProjectState {
         if (model.active_project_id == 0 or model.active_project_id > model.project_count) return null;
@@ -471,7 +473,6 @@ pub const Msg = union(enum) {
         "open_file",
         "markdown_saved",
         "finish_project_switch",
-        "webviews_ready",
     };
 
     pty: native_sdk.EffectPtyEvent,
@@ -510,7 +511,6 @@ pub const Msg = union(enum) {
     markdown_saved: MarkdownSavedMessage,
     refresh_files,
     finish_project_switch,
-    webviews_ready,
 };
 
 const DocyrusApp = native_sdk.UiAppWithFeatures(Model, Msg, .{ .runtime_markup = builtin.mode == .Debug });
@@ -1134,7 +1134,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .refresh_files => model.tree_reload_token +%= 1,
         .finish_project_switch => model.project_switching = false,
-        .webviews_ready => model.webviews_ready = true,
     }
 }
 
@@ -1150,7 +1149,6 @@ fn modalOpen(model: *const Model) bool {
 }
 
 pub fn webPanes(model: *const Model, out: []DocyrusApp.WebViewPane) usize {
-    if (!model.webviews_ready) return 0;
     out[0] = if (!modalOpen(model) and paneUsesEditor(model, .primary)) .{
         .label = primary_editor_view_label,
         .anchor = primary_editor_pane_anchor,
@@ -1221,7 +1219,6 @@ test "modals and project switches park every child webview" {
     var model: Model = .{};
     model.active_project_id = addProject(&model, "/tmp/project").?;
     syncUrls(&model);
-    model.webviews_ready = true;
     model.settings_open = true;
     var panes: [3]DocyrusApp.WebViewPane = undefined;
     _ = webPanes(&model, &panes);
@@ -1256,17 +1253,20 @@ test "file tree reads only the selected absolute project root" {
     const root_len = try tmp.dir.realPath(std.testing.io, &root_storage);
     const root = root_storage[0..root_len];
     var output: [64 * 1024]u8 = undefined;
-    const json = try writeProjectTreeJson(std.testing.io, root, &output);
+    const json = try writeProjectTreeJson(std.testing.io, root, 0, &output);
 
     const Payload = struct {
         root: []const u8,
         paths: []const []const u8,
+        nextOffset: usize,
+        done: bool,
         truncated: bool,
         skipped: usize,
     };
     const parsed = try std.json.parseFromSlice(Payload, std.testing.allocator, json, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(root, parsed.value.root);
+    try std.testing.expect(parsed.value.done);
     try std.testing.expect(!parsed.value.truncated);
 
     var saw_root_file = false;
@@ -1283,6 +1283,43 @@ test "file tree reads only the selected absolute project root" {
     var model: Model = .{};
     try std.testing.expect(addProject(&model, "relative/project") == null);
     try std.testing.expect(addProject(&model, root) != null);
+}
+
+test "file tree paginates without losing project entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (0..bridge_tree_page_limit + 17) |index| {
+        var path_buffer: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, "file-{d}.txt", .{index});
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "test" });
+    }
+
+    var root_storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_storage);
+    const root = root_storage[0..root_len];
+    const Payload = struct {
+        paths: []const []const u8,
+        nextOffset: usize,
+        done: bool,
+    };
+
+    var output: [64 * 1024]u8 = undefined;
+    var offset: usize = 0;
+    var total: usize = 0;
+    var pages: usize = 0;
+    while (true) {
+        const json = try writeProjectTreeJson(std.testing.io, root, offset, &output);
+        const parsed = try std.json.parseFromSlice(Payload, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.nextOffset > offset);
+        total += parsed.value.paths.len;
+        pages += 1;
+        if (parsed.value.done) break;
+        offset = parsed.value.nextOffset;
+    }
+
+    try std.testing.expect(pages > 1);
+    try std.testing.expectEqual(bridge_tree_page_limit + 17, total);
 }
 
 const app_permissions = [_][]const u8{
@@ -1305,6 +1342,39 @@ const shell_views = [_]native_sdk.ShellView{
         .gpu_alpha_mode = .@"opaque",
         .gpu_color_space = .srgb,
         .gpu_vsync = true,
+    },
+    .{
+        .label = primary_editor_view_label,
+        .kind = .webview,
+        .parent = canvas_label,
+        .x = 0,
+        .y = 0,
+        .width = 1,
+        .height = 1,
+        .layer = 20,
+        .url = "zero://app/index.html?project=0&slot=0&theme=system",
+    },
+    .{
+        .label = secondary_editor_view_label,
+        .kind = .webview,
+        .parent = canvas_label,
+        .x = 0,
+        .y = 0,
+        .width = 1,
+        .height = 1,
+        .layer = 20,
+        .url = "zero://app/index.html?project=0&slot=0&theme=system",
+    },
+    .{
+        .label = tree_view_label,
+        .kind = .webview,
+        .parent = canvas_label,
+        .x = 0,
+        .y = 0,
+        .width = 1,
+        .height = 1,
+        .layer = 18,
+        .url = "zero://app/tree.html?project=0&theme=system",
     },
 };
 
@@ -1379,14 +1449,6 @@ const AppHost = struct {
             std.log.err("base UI start failed: {s}", .{@errorName(err)});
             return err;
         };
-        self.createChildWebViews(runtime) catch |err| {
-            std.log.err("child WebView creation failed: {s}", .{@errorName(err)});
-            return err;
-        };
-        self.ui.dispatch(runtime, 1, .webviews_ready) catch |err| {
-            std.log.err("initial WebView reconcile failed: {s}", .{@errorName(err)});
-            return err;
-        };
     }
 
     fn eventFn(context: *anyopaque, runtime: *native_sdk.Runtime, event: native_sdk.Event) anyerror!void {
@@ -1411,25 +1473,6 @@ const AppHost = struct {
     fn replayFn(context: *anyopaque, control: native_sdk.runtime.ReplayControl) anyerror!void {
         const self: *AppHost = @ptrCast(@alignCast(context));
         try self.base.replayControl(control);
-    }
-
-    fn createChildWebViews(_: *AppHost, runtime: *native_sdk.Runtime) !void {
-        const definitions = [_]struct { label: []const u8, url: []const u8, layer: i32 }{
-            .{ .label = primary_editor_view_label, .url = "zero://app/index.html?project=0&slot=0&theme=system", .layer = 20 },
-            .{ .label = secondary_editor_view_label, .url = "zero://app/index.html?project=0&slot=0&theme=system", .layer = 20 },
-            .{ .label = tree_view_label, .url = "zero://app/tree.html?project=0&theme=system", .layer = 18 },
-        };
-        for (definitions) |definition| {
-            _ = try runtime.createView(.{
-                .window_id = 1,
-                .label = definition.label,
-                .kind = .webview,
-                .frame = geometry.RectF.init(0, 0, 1, 1),
-                .layer = definition.layer,
-                .url = definition.url,
-                .bridge_enabled = true,
-            });
-        }
     }
 
     fn showDirectoryPicker(self: *AppHost, runtime: *native_sdk.Runtime) anyerror!void {
@@ -1476,8 +1519,10 @@ const AppHost = struct {
     fn listTree(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
         const self: *AppHost = @ptrCast(@alignCast(context));
         if (!std.mem.eql(u8, invocation.source.webview_label, tree_view_label)) return error.InvalidBridgeSource;
+        const parsed = try std.json.parseFromSlice(BridgeTreePage, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
         const active = try self.activeBridgeProject();
-        return writeProjectTreeJson(self.io, active.project.path(), output);
+        return writeProjectTreeJson(self.io, active.project.path(), parsed.value.offset, output);
     }
 
     fn openPath(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -1548,13 +1593,18 @@ fn isEditorView(label: []const u8) bool {
 }
 
 fn ignoredDirectory(name: []const u8) bool {
-    const ignored = [_][]const u8{ ".git", ".zig-cache", ".native", "node_modules", "zig-out", ".next", ".turbo" };
+    const ignored = [_][]const u8{ ".git", ".zig-cache", ".native", "node_modules", "zig-out", "zig-pkg", ".next", ".turbo" };
     for (ignored) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
 }
 
-fn writeProjectTreeJson(io: std.Io, project_path: []const u8, output: []u8) ![]const u8 {
+const BridgeTreePage = struct {
+    offset: usize = 0,
+};
+
+fn writeProjectTreeJson(io: std.Io, project_path: []const u8, offset: usize, output: []u8) ![]const u8 {
     if (!std.fs.path.isAbsolute(project_path)) return error.InvalidProjectPath;
+    if (offset > bridge_tree_limit) return error.InvalidTreeOffset;
 
     // Open the selected root explicitly. Never let an empty or relative path
     // fall through to the process working directory inside an app bundle.
@@ -1571,17 +1621,22 @@ fn writeProjectTreeJson(io: std.Io, project_path: []const u8, output: []u8) ![]c
     try std.json.Stringify.value(project_path, .{}, &writer);
     try writer.writeAll(",\"paths\":[");
 
-    var count: usize = 0;
+    var visited: usize = 0;
+    var page_count: usize = 0;
     var skipped: usize = 0;
-    var truncated = false;
+    var reached_end = false;
     var first = true;
-    while (count < bridge_tree_limit) {
+    while (visited < bridge_tree_limit) {
         const entry = walker.next(io) catch {
             // An unreadable descendant must not discard files already found in
             // the selected project. Return the useful partial tree instead.
             skipped += 1;
+            reached_end = true;
             break;
-        } orelse break;
+        } orelse {
+            reached_end = true;
+            break;
+        };
 
         if (entry.kind == .directory and ignoredDirectory(entry.basename)) continue;
         if (entry.path.len > relative_path_capacity - 2) {
@@ -1589,25 +1644,56 @@ fn writeProjectTreeJson(io: std.Io, project_path: []const u8, output: []u8) ![]c
             continue;
         }
 
+        var path_buffer: [relative_path_capacity]u8 = undefined;
+        const path = if (entry.kind == .directory)
+            try std.fmt.bufPrint(&path_buffer, "{s}/", .{entry.path})
+        else
+            entry.path;
+
+        if (visited < offset) {
+            visited += 1;
+            if (entry.kind == .directory) {
+                walker.enter(io, entry) catch {
+                    skipped += 1;
+                    continue;
+                };
+            }
+            continue;
+        }
+
+        if (page_count >= bridge_tree_page_limit) break;
+
+        // Encode one path separately so the page can stop before it exceeds
+        // the bridge's response limit, including JSON escaping expansion.
+        var encoded_buffer: [relative_path_capacity * 6 + 2]u8 = undefined;
+        var encoded_writer: std.Io.Writer = .fixed(&encoded_buffer);
+        try std.json.Stringify.value(path, .{}, &encoded_writer);
+        const encoded = encoded_writer.buffered();
+        const response_budget = @min(output.len, bridge_tree_page_budget);
+        if (writer.buffered().len + encoded.len + 160 > response_budget) break;
+
         if (!first) try writer.writeByte(',');
         first = false;
+        try writer.writeAll(encoded);
+        visited += 1;
+        page_count += 1;
         if (entry.kind == .directory) {
-            var path_buffer: [relative_path_capacity]u8 = undefined;
-            const path = try std.fmt.bufPrint(&path_buffer, "{s}/", .{entry.path});
-            try std.json.Stringify.value(path, .{}, &writer);
             walker.enter(io, entry) catch {
                 skipped += 1;
-                count += 1;
                 continue;
             };
-        } else {
-            try std.json.Stringify.value(entry.path, .{}, &writer);
         }
-        count += 1;
     }
-    if (count == bridge_tree_limit) truncated = true;
 
-    try writer.writeAll("],\"truncated\":");
+    const next_offset = offset + page_count;
+    const truncated = next_offset >= bridge_tree_limit and !reached_end;
+    const done = reached_end or truncated;
+
+    try writer.writeAll("],\"nextOffset\":");
+    try writer.print("{d}", .{next_offset});
+    try writer.writeAll(",\"done\":");
+    try writer.writeAll(if (done) "true" else "false");
+    try writer.writeAll(",\"truncated\":");
     try writer.writeAll(if (truncated) "true" else "false");
     try writer.writeAll(",\"skipped\":");
     try writer.print("{d}", .{skipped});
