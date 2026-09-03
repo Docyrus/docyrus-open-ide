@@ -56,10 +56,10 @@ jobs:
         run: npm run check
 
       # `native` asks before downloading its pinned Zig toolchain, and CI has no
-      # tty to answer, so pass --yes. The first zig-needing step fetches it; the
-      # cache above keeps later runs from re-downloading.
+      # tty to answer, so pass --yes. This step fetches it on a cold cache.
+      #
+      # CI does not run `npm run build`: the ReleaseFast build dominates the run
+      # time, and `native test` already compiles the app in Debug. Run
+      # `npm run build` locally before anything that touches the build graph.
       - name: Test
         run: npm test -- --yes
-
-      - name: Build
-        run: npm run build -- --yes
