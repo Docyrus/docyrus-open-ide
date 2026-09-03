@@ -32,7 +32,7 @@ jobs:
       # on first build, and Ghostty into the project package cache. Both are
       # slow and version-pinned, so cache them on the lockfile + manifest.
       - name: Cache Zig toolchain and packages
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.native/toolchains
