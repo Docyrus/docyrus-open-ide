@@ -17,6 +17,8 @@ permissions:
 jobs:
   membership:
     name: check author membership
+    # Bots open pull requests too (Dependabot), and they are never org members.
+    if: github.event.pull_request.user.type != 'Bot'
     runs-on: ubuntu-latest
     steps:
       - name: Flag non-member pull requests

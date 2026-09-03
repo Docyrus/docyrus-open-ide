@@ -12,7 +12,7 @@
 
 - [ ] `npm run check`
 - [ ] `npm test`
-- [ ] `npm run build` (required if this touches the build, `app.json`, or bridge commands)
+- [ ] `npm run build` — **not run by CI**; required if this touches the build, `app.json`, or bridge commands
 - [ ] Ran `npm run dev` and exercised the change in a real window
 
 Steps you clicked through, and what you observed:

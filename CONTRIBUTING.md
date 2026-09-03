@@ -51,11 +51,16 @@ pick a folder.
 ```sh
 npm run check   # markup, manifest, and core validation
 npm test        # Zig unit tests in src/main.zig
-npm run build   # release build — run for anything touching the build or manifest
+npm run build   # release build — CI does not run this, so run it yourself
 ```
 
 `check`, `test`, and `build` all regenerate `frontend/dist/tree.js` first, so run
 them before committing if you touched `frontend/tree.js`.
+
+CI runs `check` and `test` only — the ReleaseFast build is too slow to gate every
+pull request, and `native test` already compiles the app in Debug. That makes
+`npm run build` your responsibility for anything touching the build graph,
+`app.json`, or bridge commands: a release-only break will not be caught for you.
 
 ## Working in this codebase
 
