@@ -8,7 +8,53 @@
     "icons": ["assets/docyrus-open-ide-icon.png"],
     "platforms": ["macos"],
     "permissions": ["view", "command", "clipboard", "filesystem"],
-    "capabilities": ["native_views", "gpu_surfaces", "webview", "js_bridge", "clipboard", "reveal_path"],
+    "capabilities": ["native_views", "gpu_surfaces", "webview", "js_bridge", "clipboard", "reveal_path", "file_associations"],
+    "file_associations": [
+        {
+            "name": "Code and Text Document",
+            "role": "editor",
+            "extensions": [
+                "txt", "md", "markdown", "mdx", "json", "jsonc", "yaml", "yml",
+                "toml", "xml", "csv", "tsv", "ini", "cfg", "conf", "log",
+                "c", "h", "cpp", "hpp", "m", "mm", "swift", "zig",
+                "rs", "go", "java", "kt", "py", "rb", "js", "ts"
+            ],
+            "mime_types": ["text/plain"]
+        },
+        {
+            "name": "Web and Script Source",
+            "role": "editor",
+            "extensions": [
+                "mjs", "cjs", "jsx", "mts", "cts", "tsx", "html", "htm",
+                "css", "scss", "sass", "less", "vue", "svelte", "astro", "php",
+                "sh", "bash", "zsh", "fish", "ps1", "bat", "cmd", "sql",
+                "graphql", "gql", "proto", "lua", "pl", "pm", "r", "dart"
+            ],
+            "mime_types": ["text/plain"]
+        },
+        {
+            "name": "Configuration and Documentation",
+            "role": "editor",
+            "extensions": [
+                "json5", "properties", "env", "editorconfig", "gitignore", "gitattributes", "npmrc", "nvmrc",
+                "rst", "adoc", "asciidoc", "tex", "bib", "org", "wiki", "textile",
+                "gradle", "kts", "cmake", "mk", "podspec", "lock", "diff", "patch",
+                "dockerignore", "eslintignore", "prettierignore", "stylelintignore", "tf", "tfvars", "hcl", "cue"
+            ],
+            "mime_types": ["text/plain"]
+        },
+        {
+            "name": "Additional Source Code",
+            "role": "editor",
+            "extensions": [
+                "cs", "fs", "fsx", "vb", "scala", "sc", "groovy", "gvy",
+                "clj", "cljs", "cljc", "edn", "ex", "exs", "erl", "hrl",
+                "hs", "lhs", "elm", "ml", "mli", "pas", "asm", "s",
+                "v", "vhd", "vhdl", "sol", "tcl", "vim", "wasm", "wat"
+            ],
+            "mime_types": ["text/plain"]
+        }
+    ],
     "bridge": {
         "commands": [
             { "name": "workspace.listTree", "permissions": ["filesystem"], "origins": ["zero://app"] },

@@ -217,11 +217,12 @@
   </row>
   <separator />
 
+  <if test="{has_projects}">
   <split grow="1" value="{project_sidebar_fraction}" on-resize="project_sidebar_resized" gap="1">
     <column min-width="160" max-width="360" background="surface_subtle" label="Project Folders">
       <scroll grow="1">
         <column padding="6" gap="4">
-          <for each="openProjects" key="path" as="project">
+          <for each="openProjects" key="id" as="project">
             <panel height="56" role="button" selected="{project.selected}" on-press="select_project:{project.id}" on-drag="drag_project:{project.id}" on-hover-enter="hover_project:{project.id}" on-hover-leave="leave_project:{project.id}" label="{project.path}">
               <row padding="6" gap="4" cross="start">
                 <column grow="1" gap="3" cross="start">
@@ -269,6 +270,7 @@
       <else><use template="workspace" /></else>
     </row>
   </split>
+  </if>
 
   <if test="{rename_project_open}">
     <dialog label="Rename project" on-dismiss="cancel_rename_project">
@@ -312,7 +314,9 @@
           </scroll>
         </if>
         <else><text foreground="text_muted">No recent projects yet.</text></else>
-        <row main="end"><button variant="ghost" on-press="close_add_project">Cancel</button></row>
+        <if test="{has_projects}">
+          <row main="end"><button variant="ghost" on-press="close_add_project">Cancel</button></row>
+        </if>
       </column>
     </dialog>
   </if>
