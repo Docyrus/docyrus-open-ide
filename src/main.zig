@@ -26,6 +26,7 @@ const max_recent_projects: usize = 10;
 const max_tabs: usize = 10;
 const max_file_tabs: usize = 8;
 const max_panes: usize = 4;
+const required_web_pane_count: usize = max_panes + 1;
 const max_external_files: usize = 64;
 const max_pending_open_files: usize = 16;
 const project_path_capacity: usize = 1024;
@@ -2195,6 +2196,7 @@ fn paneVisible(model: *const Model, pane: Pane) bool {
 }
 
 pub fn webPanes(model: *const Model, out: []DocyrusApp.WebViewPane) usize {
+    if (out.len < required_web_pane_count) @panic("Docyrus requires five Native SDK WebView pane slots");
     out[0] = if (!modalOpen(model) and paneUsesEditor(model, .primary)) .{
         .label = primary_editor_view_label,
         .anchor = primary_editor_pane_anchor,
@@ -2229,7 +2231,7 @@ pub fn webPanes(model: *const Model, out: []DocyrusApp.WebViewPane) usize {
         .url = model.treeUrl(),
         .reload_token = model.tree_reload_token,
     } else parkedPane(tree_view_label, model.treeUrl(), model.tree_reload_token);
-    return 5;
+    return required_web_pane_count;
 }
 
 fn themeState(model: *const Model) DocyrusApp.ThemeState {
@@ -2561,13 +2563,15 @@ test "markdown editor and preview toggles always leave one surface visible" {
     try std.testing.expect(model.primary_markdown_preview_visible());
 }
 
-test "modals and project switches park every child webview" {
+test "five WebView panes include every editor and the File Explorer" {
     var model: Model = .{};
     model.active_project_id = addProject(&model, "/tmp/project").?;
     syncUrls(&model);
     model.settings_open = true;
-    var panes: [5]DocyrusApp.WebViewPane = undefined;
-    _ = webPanes(&model, &panes);
+    var panes: [required_web_pane_count]DocyrusApp.WebViewPane = undefined;
+    try std.testing.expectEqual(required_web_pane_count, webPanes(&model, &panes));
+    try std.testing.expectEqualStrings(primary_editor_view_label, panes[0].label);
+    try std.testing.expectEqualStrings(tree_view_label, panes[required_web_pane_count - 1].label);
     for (panes) |pane| {
         try std.testing.expectEqual(@as(f32, 1), pane.frame.width);
         try std.testing.expect(pane.anchor == null);
