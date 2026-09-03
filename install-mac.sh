@@ -2,9 +2,11 @@
 set -euo pipefail
 
 APP_NAME="Docyrus Open IDE"
-ARCHIVE_NAME="Docyrus-Open-IDE-macos-arm64.zip"
+RELEASE_TAG="v0.1.4"
+ARCHIVE_NAME="Docyrus-Open-IDE-v0.1.4-macos-arm64.zip"
+EXPECTED_SHA256="e3d69d885f43573c086e098a3eff3f8bc44bd37713777cb99bfb69f5a9dd9fbf"
 INSTALL_PATH="/Applications/${APP_NAME}.app"
-DOWNLOAD_URL="https://github.com/Docyrus/docyrus-open-ide/releases/latest/download/${ARCHIVE_NAME}"
+DOWNLOAD_URL="https://github.com/Docyrus/docyrus-open-ide/releases/download/${RELEASE_TAG}/${ARCHIVE_NAME}?hotfix=1"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "Docyrus Open IDE currently supports macOS only." >&2
@@ -16,7 +18,7 @@ if [[ "$(uname -m)" != "arm64" ]]; then
   exit 1
 fi
 
-for command in curl ditto xattr open; do
+for command in curl ditto pgrep shasum xattr open; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "Required command not found: ${command}" >&2
     exit 1
@@ -27,12 +29,23 @@ TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf "${TEMP_DIR}"' EXIT
 
 echo "Downloading ${APP_NAME}..."
-curl -fL --retry 3 --progress-bar "${DOWNLOAD_URL}" -o "${TEMP_DIR}/${ARCHIVE_NAME}"
+curl -fL --retry 3 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' --progress-bar "${DOWNLOAD_URL}" -o "${TEMP_DIR}/${ARCHIVE_NAME}"
+
+if ! printf '%s  %s\n' "${EXPECTED_SHA256}" "${TEMP_DIR}/${ARCHIVE_NAME}" | shasum -a 256 -c - >/dev/null; then
+  echo "Downloaded archive checksum did not match ${RELEASE_TAG}; refusing to install." >&2
+  exit 1
+fi
+
 ditto -x -k "${TEMP_DIR}/${ARCHIVE_NAME}" "${TEMP_DIR}/expanded"
 
 SOURCE_APP="${TEMP_DIR}/expanded/${APP_NAME}.app"
 if [[ ! -d "${SOURCE_APP}" ]]; then
   echo "The release archive did not contain ${APP_NAME}.app." >&2
+  exit 1
+fi
+
+if pgrep -x "docyrus-open-ide" >/dev/null 2>&1; then
+  echo "Quit ${APP_NAME}, then run this installer again." >&2
   exit 1
 fi
 
