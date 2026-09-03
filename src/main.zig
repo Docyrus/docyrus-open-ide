@@ -11,9 +11,13 @@ const geometry = native_sdk.geometry;
 pub const canvas_label = "docyrus-canvas";
 pub const primary_editor_view_label = "docyrus-monaco-primary";
 pub const secondary_editor_view_label = "docyrus-monaco-secondary";
+pub const tertiary_editor_view_label = "docyrus-monaco-tertiary";
+pub const quaternary_editor_view_label = "docyrus-monaco-quaternary";
 pub const tree_view_label = "docyrus-file-tree";
 pub const primary_editor_pane_anchor = "primary-editor-pane";
 pub const secondary_editor_pane_anchor = "secondary-editor-pane";
+pub const tertiary_editor_pane_anchor = "tertiary-editor-pane";
+pub const quaternary_editor_pane_anchor = "quaternary-editor-pane";
 pub const tree_pane_anchor = "file-tree-pane";
 
 const bundle_id = "com.docyrus.open-ide";
@@ -21,6 +25,7 @@ const max_projects: usize = 10;
 const max_recent_projects: usize = 10;
 const max_tabs: usize = 10;
 const max_file_tabs: usize = 8;
+const max_panes: usize = 4;
 const max_external_files: usize = 64;
 const max_pending_open_files: usize = 16;
 const project_path_capacity: usize = 1024;
@@ -36,8 +41,11 @@ const clipboard_effect_key_start: u64 = 100;
 
 pub const window_width: f32 = 1440;
 pub const window_height: f32 = 920;
+const workspace_chrome_height: f32 = 43;
+const horizontal_split_divider_height: f32 = 9;
+const horizontal_split_min_pane_height: f32 = 140;
 
-const Pane = enum(u8) { primary = 1, secondary = 2 };
+const Pane = enum(u8) { primary = 1, secondary = 2, tertiary = 3, quaternary = 4 };
 const SplitMode = enum { horizontal, vertical };
 const ThemeMode = enum(u8) { system = 0, light = 1, dark = 2 };
 const FileKind = enum(u8) { code, markdown, image, text };
@@ -153,16 +161,25 @@ const LayoutState = struct {
     explorer_open: bool = true,
     explorer_fraction: f32 = 0.215,
     split_fraction: f32 = 0.58,
+    split_drag_origin: f32 = 0.58,
+    split_drag_active: bool = false,
     markdown_fraction: f32 = 0.56,
     split_mode: SplitMode = .vertical,
     secondary_panel_open: bool = false,
+    primary_child_fraction: f32 = 0.5,
+    primary_child_drag_origin: f32 = 0.5,
+    primary_child_drag_active: bool = false,
+    primary_child_mode: SplitMode = .vertical,
+    primary_child_open: bool = false,
+    secondary_child_fraction: f32 = 0.5,
+    secondary_child_drag_origin: f32 = 0.5,
+    secondary_child_drag_active: bool = false,
+    secondary_child_mode: SplitMode = .vertical,
+    secondary_child_open: bool = false,
     active_pane: Pane = .primary,
-    primary_order: [max_tabs]u8 = [_]u8{0} ** max_tabs,
-    primary_tab_count: u8 = 0,
-    primary_active_tab: u8 = 0,
-    secondary_order: [max_tabs]u8 = [_]u8{0} ** max_tabs,
-    secondary_tab_count: u8 = 0,
-    secondary_active_tab: u8 = 0,
+    pane_orders: [max_panes][max_tabs]u8 = [_][max_tabs]u8{[_]u8{0} ** max_tabs} ** max_panes,
+    pane_tab_counts: [max_panes]u8 = [_]u8{0} ** max_panes,
+    pane_active_tabs: [max_panes]u8 = [_]u8{0} ** max_panes,
     file_tabs: [max_file_tabs]FileTab = [_]FileTab{.{}} ** max_file_tabs,
     term_one_scrollback: u32 = 0,
     term_two_scrollback: u32 = 0,
@@ -277,11 +294,17 @@ pub const Model = struct {
         "rename_project_buffer",
         "primary_reload_token",
         "secondary_reload_token",
+        "tertiary_reload_token",
+        "quaternary_reload_token",
         "tree_reload_token",
         "primary_url_buffer",
         "primary_url_len",
         "secondary_url_buffer",
         "secondary_url_len",
+        "tertiary_url_buffer",
+        "tertiary_url_len",
+        "quaternary_url_buffer",
+        "quaternary_url_len",
         "tree_url_buffer",
         "tree_url_len",
         "path_scratch",
@@ -292,6 +315,8 @@ pub const Model = struct {
         "clipboard_key",
         "primaryEditorUrl",
         "secondaryEditorUrl",
+        "tertiaryEditorUrl",
+        "quaternaryEditorUrl",
         "treeUrl",
     };
 
@@ -328,11 +353,17 @@ pub const Model = struct {
     project_drag_active: bool = false,
     primary_reload_token: u64 = 0,
     secondary_reload_token: u64 = 0,
+    tertiary_reload_token: u64 = 0,
+    quaternary_reload_token: u64 = 0,
     tree_reload_token: u64 = 0,
     primary_url_buffer: [256]u8 = undefined,
     primary_url_len: usize = 0,
     secondary_url_buffer: [256]u8 = undefined,
     secondary_url_len: usize = 0,
+    tertiary_url_buffer: [256]u8 = undefined,
+    tertiary_url_len: usize = 0,
+    quaternary_url_buffer: [256]u8 = undefined,
+    quaternary_url_len: usize = 0,
     tree_url_buffer: [256]u8 = undefined,
     tree_url_len: usize = 0,
     path_scratch: [2048]u8 = undefined,
@@ -452,6 +483,10 @@ pub const Model = struct {
         return layout.split_fraction;
     }
 
+    pub fn secondary_split_fraction(model: *const Model) f32 {
+        return 1 - model.split_fraction();
+    }
+
     pub fn markdown_fraction(model: *const Model) f32 {
         const layout = model.activeLayoutConst() orelse return 0.56;
         return layout.markdown_fraction;
@@ -467,6 +502,54 @@ pub const Model = struct {
         return layout.secondary_panel_open;
     }
 
+    pub fn primary_child_fraction(model: *const Model) f32 {
+        const layout = model.activeLayoutConst() orelse return 0.5;
+        return layout.primary_child_fraction;
+    }
+
+    pub fn primary_child_secondary_fraction(model: *const Model) f32 {
+        return 1 - model.primary_child_fraction();
+    }
+
+    pub fn primary_child_mode(model: *const Model) SplitMode {
+        const layout = model.activeLayoutConst() orelse return .vertical;
+        return layout.primary_child_mode;
+    }
+
+    pub fn primary_child_open(model: *const Model) bool {
+        const layout = model.activeLayoutConst() orelse return false;
+        return layout.primary_child_open;
+    }
+
+    pub fn primary_can_split(model: *const Model) bool {
+        const layout = model.activeLayoutConst() orelse return false;
+        return !layout.primary_child_open;
+    }
+
+    pub fn secondary_child_fraction(model: *const Model) f32 {
+        const layout = model.activeLayoutConst() orelse return 0.5;
+        return layout.secondary_child_fraction;
+    }
+
+    pub fn secondary_child_secondary_fraction(model: *const Model) f32 {
+        return 1 - model.secondary_child_fraction();
+    }
+
+    pub fn secondary_child_mode(model: *const Model) SplitMode {
+        const layout = model.activeLayoutConst() orelse return .vertical;
+        return layout.secondary_child_mode;
+    }
+
+    pub fn secondary_child_open(model: *const Model) bool {
+        const layout = model.activeLayoutConst() orelse return false;
+        return layout.secondary_child_open;
+    }
+
+    pub fn secondary_can_split(model: *const Model) bool {
+        const layout = model.activeLayoutConst() orelse return false;
+        return layout.secondary_panel_open and !layout.secondary_child_open;
+    }
+
     pub fn primaryTabs(model: *const Model, arena: std.mem.Allocator) []const TabView {
         return tabViews(model, .primary, arena);
     }
@@ -475,14 +558,32 @@ pub const Model = struct {
         return tabViews(model, .secondary, arena);
     }
 
+    pub fn tertiaryTabs(model: *const Model, arena: std.mem.Allocator) []const TabView {
+        return tabViews(model, .tertiary, arena);
+    }
+
+    pub fn quaternaryTabs(model: *const Model, arena: std.mem.Allocator) []const TabView {
+        return tabViews(model, .quaternary, arena);
+    }
+
     pub fn primary_has_tabs(model: *const Model) bool {
         const layout = model.activeLayoutConst() orelse return false;
-        return layout.primary_tab_count > 0;
+        return paneCount(layout, .primary) > 0;
     }
 
     pub fn secondary_has_tabs(model: *const Model) bool {
         const layout = model.activeLayoutConst() orelse return false;
-        return layout.secondary_tab_count > 0;
+        return paneCount(layout, .secondary) > 0;
+    }
+
+    pub fn tertiary_has_tabs(model: *const Model) bool {
+        const layout = model.activeLayoutConst() orelse return false;
+        return paneCount(layout, .tertiary) > 0;
+    }
+
+    pub fn quaternary_has_tabs(model: *const Model) bool {
+        const layout = model.activeLayoutConst() orelse return false;
+        return paneCount(layout, .quaternary) > 0;
     }
 
     pub fn primary_uses_editor(model: *const Model) bool {
@@ -491,6 +592,14 @@ pub const Model = struct {
 
     pub fn secondary_uses_editor(model: *const Model) bool {
         return paneUsesEditor(model, .secondary);
+    }
+
+    pub fn tertiary_uses_editor(model: *const Model) bool {
+        return paneUsesEditor(model, .tertiary);
+    }
+
+    pub fn quaternary_uses_editor(model: *const Model) bool {
+        return paneUsesEditor(model, .quaternary);
     }
 
     pub fn primary_is_markdown_active(model: *const Model) bool {
@@ -517,12 +626,28 @@ pub const Model = struct {
         return paneFileKind(model, .secondary) == .markdown;
     }
 
+    pub fn tertiary_is_markdown_active(model: *const Model) bool {
+        return paneFileKind(model, .tertiary) == .markdown;
+    }
+
+    pub fn quaternary_is_markdown_active(model: *const Model) bool {
+        return paneFileKind(model, .quaternary) == .markdown;
+    }
+
     pub fn primary_is_image_active(model: *const Model) bool {
         return paneFileKind(model, .primary) == .image;
     }
 
     pub fn secondary_is_image_active(model: *const Model) bool {
         return paneFileKind(model, .secondary) == .image;
+    }
+
+    pub fn tertiary_is_image_active(model: *const Model) bool {
+        return paneFileKind(model, .tertiary) == .image;
+    }
+
+    pub fn quaternary_is_image_active(model: *const Model) bool {
+        return paneFileKind(model, .quaternary) == .image;
     }
 
     pub fn primary_uses_terminal_one(model: *const Model) bool {
@@ -533,12 +658,28 @@ pub const Model = struct {
         return paneActive(model, .secondary) == 9;
     }
 
+    pub fn tertiary_uses_terminal_one(model: *const Model) bool {
+        return paneActive(model, .tertiary) == 9;
+    }
+
+    pub fn quaternary_uses_terminal_one(model: *const Model) bool {
+        return paneActive(model, .quaternary) == 9;
+    }
+
     pub fn primary_uses_terminal_two(model: *const Model) bool {
         return paneActive(model, .primary) == 10;
     }
 
     pub fn secondary_uses_terminal_two(model: *const Model) bool {
         return paneActive(model, .secondary) == 10;
+    }
+
+    pub fn tertiary_uses_terminal_two(model: *const Model) bool {
+        return paneActive(model, .tertiary) == 10;
+    }
+
+    pub fn quaternary_uses_terminal_two(model: *const Model) bool {
+        return paneActive(model, .quaternary) == 10;
     }
 
     pub fn primary_markdown_body(model: *const Model) []const u8 {
@@ -549,12 +690,44 @@ pub const Model = struct {
         return paneMarkdown(model, .secondary);
     }
 
+    pub fn tertiary_markdown_editor_visible(model: *const Model) bool {
+        return paneMarkdownEditorVisible(model, .tertiary);
+    }
+
+    pub fn tertiary_markdown_preview_visible(model: *const Model) bool {
+        return paneMarkdownPreviewVisible(model, .tertiary);
+    }
+
+    pub fn quaternary_markdown_editor_visible(model: *const Model) bool {
+        return paneMarkdownEditorVisible(model, .quaternary);
+    }
+
+    pub fn quaternary_markdown_preview_visible(model: *const Model) bool {
+        return paneMarkdownPreviewVisible(model, .quaternary);
+    }
+
+    pub fn tertiary_markdown_body(model: *const Model) []const u8 {
+        return paneMarkdown(model, .tertiary);
+    }
+
+    pub fn quaternary_markdown_body(model: *const Model) []const u8 {
+        return paneMarkdown(model, .quaternary);
+    }
+
     pub fn primaryEditorUrl(model: *const Model) []const u8 {
         return model.primary_url_buffer[0..model.primary_url_len];
     }
 
     pub fn secondaryEditorUrl(model: *const Model) []const u8 {
         return model.secondary_url_buffer[0..model.secondary_url_len];
+    }
+
+    pub fn tertiaryEditorUrl(model: *const Model) []const u8 {
+        return model.tertiary_url_buffer[0..model.tertiary_url_len];
+    }
+
+    pub fn quaternaryEditorUrl(model: *const Model) []const u8 {
+        return model.quaternary_url_buffer[0..model.quaternary_url_len];
     }
 
     pub fn treeUrl(model: *const Model) []const u8 {
@@ -567,6 +740,14 @@ pub const Model = struct {
 
     pub fn secondary_status_text(model: *const Model, arena: std.mem.Allocator) []const u8 {
         return statusText(model, .secondary, arena);
+    }
+
+    pub fn tertiary_status_text(model: *const Model, arena: std.mem.Allocator) []const u8 {
+        return statusText(model, .tertiary, arena);
+    }
+
+    pub fn quaternary_status_text(model: *const Model, arena: std.mem.Allocator) []const u8 {
+        return statusText(model, .quaternary, arena);
     }
 
     pub fn shell_key(model: *const Model) u64 {
@@ -650,6 +831,11 @@ pub const Msg = union(enum) {
     project_sidebar_resized: f32,
     explorer_resized: f32,
     split_resized: f32,
+    horizontal_split_dragged: TabDragMessage,
+    primary_child_resized: f32,
+    secondary_child_resized: f32,
+    primary_branch_horizontal_split_dragged: TabDragMessage,
+    secondary_branch_horizontal_split_dragged: TabDragMessage,
     markdown_resized: f32,
     toggle_explorer,
     activate_tab: u32,
@@ -665,8 +851,8 @@ pub const Msg = union(enum) {
     copy_relative_path: u32,
     reveal_in_finder: u32,
     open_terminal_in: u32,
-    split_horizontal,
-    split_vertical,
+    split_horizontal: u32,
+    split_vertical: u32,
     select_project: u32,
     hover_project: u32,
     leave_project: u32,
@@ -682,6 +868,7 @@ pub const Msg = union(enum) {
     close_add_project,
     choose_project_directory,
     open_recent_project: u32,
+    remove_recent_project: u32,
     directory_selected: []const u8,
     directory_picker_cancelled,
     open_settings,
@@ -693,6 +880,10 @@ pub const Msg = union(enum) {
     toggle_primary_markdown_preview,
     toggle_secondary_markdown_editor,
     toggle_secondary_markdown_preview,
+    toggle_tertiary_markdown_editor,
+    toggle_tertiary_markdown_preview,
+    toggle_quaternary_markdown_editor,
+    toggle_quaternary_markdown_preview,
     toggle_markdown_editor: u32,
     toggle_markdown_preview: u32,
     open_file: OpenFileMessage,
@@ -771,24 +962,36 @@ fn tabIcon(layout: *const LayoutState, id: u32) []const u8 {
     };
 }
 
+fn paneIndex(pane: Pane) usize {
+    return @intFromEnum(pane) - 1;
+}
+
+fn paneFromId(id: u32) ?Pane {
+    return switch (id) {
+        1 => .primary,
+        2 => .secondary,
+        3 => .tertiary,
+        4 => .quaternary,
+        else => null,
+    };
+}
+
 fn paneOrder(layout: *const LayoutState, pane: Pane) []const u8 {
-    return if (pane == .primary)
-        layout.primary_order[0..layout.primary_tab_count]
-    else
-        layout.secondary_order[0..layout.secondary_tab_count];
+    const index = paneIndex(pane);
+    return layout.pane_orders[index][0..layout.pane_tab_counts[index]];
 }
 
 fn paneActive(model: *const Model, pane: Pane) u8 {
     const layout = model.activeLayoutConst() orelse return 0;
-    return if (pane == .primary) layout.primary_active_tab else layout.secondary_active_tab;
+    return layout.pane_active_tabs[paneIndex(pane)];
 }
 
 fn setPaneActive(layout: *LayoutState, pane: Pane, id: u8) void {
-    if (pane == .primary) layout.primary_active_tab = id else layout.secondary_active_tab = id;
+    layout.pane_active_tabs[paneIndex(pane)] = id;
 }
 
 fn paneCount(layout: *const LayoutState, pane: Pane) u8 {
-    return if (pane == .primary) layout.primary_tab_count else layout.secondary_tab_count;
+    return layout.pane_tab_counts[paneIndex(pane)];
 }
 
 fn paneFileKind(model: *const Model, pane: Pane) ?FileKind {
@@ -845,8 +1048,9 @@ fn tabViews(model: *const Model, pane: Pane, arena: std.mem.Allocator) []const T
 }
 
 fn paneForTab(layout: *const LayoutState, id: u32) ?Pane {
-    for (paneOrder(layout, .primary)) |candidate| if (candidate == id) return .primary;
-    for (paneOrder(layout, .secondary)) |candidate| if (candidate == id) return .secondary;
+    inline for (std.meta.tags(Pane)) |pane| {
+        for (paneOrder(layout, pane)) |candidate| if (candidate == id) return pane;
+    }
     return null;
 }
 
@@ -1007,8 +1211,7 @@ fn selectProject(model: *Model, project_id: u32) void {
     model.active_project_id = project_id;
     model.project_switching = true;
     model.preview_image = 0;
-    model.primary_reload_token +%= 1;
-    model.secondary_reload_token +%= 1;
+    bumpAllEditorReloads(model);
     model.tree_reload_token +%= 1;
     syncUrls(model);
 }
@@ -1029,6 +1232,11 @@ fn removeRecentProject(model: *Model, path: []const u8) void {
         }
     }
     const index = found orelse return;
+    removeRecentProjectAt(model, index);
+}
+
+fn removeRecentProjectAt(model: *Model, index: usize) void {
+    if (index >= model.recent_count) return;
     var cursor = index;
     while (cursor + 1 < model.recent_count) : (cursor += 1) model.recent_projects[cursor] = model.recent_projects[cursor + 1];
     model.recent_count -= 1;
@@ -1108,8 +1316,7 @@ fn closeProject(model: *Model, project_id: u32, forget: bool, fx: *Effects) void
     model.rename_project_id = 0;
     model.project_switching = model.active_project_id != 0;
     model.preview_image = 0;
-    model.primary_reload_token +%= 1;
-    model.secondary_reload_token +%= 1;
+    bumpAllEditorReloads(model);
     model.tree_reload_token +%= 1;
     syncUrls(model);
 }
@@ -1141,14 +1348,33 @@ fn handleProjectDrag(model: *Model, event: ProjectDragMessage) void {
     }
 }
 
+fn bumpEditorReload(model: *Model, pane: Pane) void {
+    switch (pane) {
+        .primary => model.primary_reload_token +%= 1,
+        .secondary => model.secondary_reload_token +%= 1,
+        .tertiary => model.tertiary_reload_token +%= 1,
+        .quaternary => model.quaternary_reload_token +%= 1,
+    }
+}
+
+fn bumpAllEditorReloads(model: *Model) void {
+    inline for (std.meta.tags(Pane)) |pane| bumpEditorReload(model, pane);
+}
+
 fn syncUrls(model: *Model) void {
     const theme = themeName(model.theme_mode);
     const primary_slot = paneActive(model, .primary);
     const secondary_slot = paneActive(model, .secondary);
+    const tertiary_slot = paneActive(model, .tertiary);
+    const quaternary_slot = paneActive(model, .quaternary);
     const primary = std.fmt.bufPrint(&model.primary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}", .{ model.active_project_id, primary_slot, theme }) catch "";
     model.primary_url_len = primary.len;
     const secondary = std.fmt.bufPrint(&model.secondary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}", .{ model.active_project_id, secondary_slot, theme }) catch "";
     model.secondary_url_len = secondary.len;
+    const tertiary = std.fmt.bufPrint(&model.tertiary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}", .{ model.active_project_id, tertiary_slot, theme }) catch "";
+    model.tertiary_url_len = tertiary.len;
+    const quaternary = std.fmt.bufPrint(&model.quaternary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}", .{ model.active_project_id, quaternary_slot, theme }) catch "";
+    model.quaternary_url_len = quaternary.len;
     const tree = std.fmt.bufPrint(&model.tree_url_buffer, "zero://app/tree.html?project={d}&theme={s}", .{ model.active_project_id, theme }) catch "";
     model.tree_url_len = tree.len;
 }
@@ -1157,46 +1383,44 @@ fn insertTabRaw(layout: *LayoutState, pane: Pane, id: u8, requested_index: usize
     const count: usize = paneCount(layout, pane);
     if (count >= max_tabs) return;
     const index = @min(requested_index, count);
-    if (pane == .primary) {
-        var cursor = count;
-        while (cursor > index) : (cursor -= 1) layout.primary_order[cursor] = layout.primary_order[cursor - 1];
-        layout.primary_order[index] = id;
-        layout.primary_tab_count += 1;
-    } else {
-        var cursor = count;
-        while (cursor > index) : (cursor -= 1) layout.secondary_order[cursor] = layout.secondary_order[cursor - 1];
-        layout.secondary_order[index] = id;
-        layout.secondary_tab_count += 1;
-        layout.secondary_panel_open = true;
+    const pane_index = paneIndex(pane);
+    var cursor = count;
+    while (cursor > index) : (cursor -= 1) layout.pane_orders[pane_index][cursor] = layout.pane_orders[pane_index][cursor - 1];
+    layout.pane_orders[pane_index][index] = id;
+    layout.pane_tab_counts[pane_index] += 1;
+    switch (pane) {
+        .primary => {},
+        .secondary => layout.secondary_panel_open = true,
+        .tertiary => {
+            layout.secondary_panel_open = true;
+            layout.primary_child_open = true;
+        },
+        .quaternary => {
+            layout.secondary_panel_open = true;
+            layout.secondary_child_open = true;
+        },
     }
 }
 
 fn removeTabRaw(layout: *LayoutState, pane: Pane, index: usize) u8 {
-    if (pane == .primary) {
-        const removed = layout.primary_order[index];
-        var cursor = index;
-        while (cursor + 1 < layout.primary_tab_count) : (cursor += 1) layout.primary_order[cursor] = layout.primary_order[cursor + 1];
-        layout.primary_tab_count -= 1;
-        layout.primary_order[layout.primary_tab_count] = 0;
-        return removed;
-    }
-    const removed = layout.secondary_order[index];
+    const pane_index = paneIndex(pane);
+    const removed = layout.pane_orders[pane_index][index];
     var cursor = index;
-    while (cursor + 1 < layout.secondary_tab_count) : (cursor += 1) layout.secondary_order[cursor] = layout.secondary_order[cursor + 1];
-    layout.secondary_tab_count -= 1;
-    layout.secondary_order[layout.secondary_tab_count] = 0;
+    while (cursor + 1 < layout.pane_tab_counts[pane_index]) : (cursor += 1) layout.pane_orders[pane_index][cursor] = layout.pane_orders[pane_index][cursor + 1];
+    layout.pane_tab_counts[pane_index] -= 1;
+    layout.pane_orders[pane_index][layout.pane_tab_counts[pane_index]] = 0;
     return removed;
 }
 
 fn syncPaneActive(layout: *LayoutState, pane: Pane) void {
-    const active = if (pane == .primary) layout.primary_active_tab else layout.secondary_active_tab;
+    const active = layout.pane_active_tabs[paneIndex(pane)];
     if (active != 0 and tabIndex(layout, pane, active) != null) return;
     const order = paneOrder(layout, pane);
     setPaneActive(layout, pane, if (order.len > 0) order[0] else 0);
 }
 
 fn activeFileSlot(layout: *const LayoutState, pane: Pane) ?usize {
-    const id = if (pane == .primary) layout.primary_active_tab else layout.secondary_active_tab;
+    const id = layout.pane_active_tabs[paneIndex(pane)];
     if (id < 1 or id > max_file_tabs) return null;
     if (!layout.file_tabs[id - 1].used) return null;
     return id - 1;
@@ -1224,7 +1448,7 @@ fn activateTab(model: *Model, id: u32, fx: *Effects) void {
     layout.active_pane = pane;
     if (id == 9 or id == 10) ensureTerminal(model, @intCast(id - 9), fx);
     if (id <= max_file_tabs and layout.file_tabs[id - 1].kind == .image) ensureImage(model, id, fx);
-    if (pane == .primary) model.primary_reload_token +%= 1 else model.secondary_reload_token +%= 1;
+    bumpEditorReload(model, pane);
     syncUrls(model);
 }
 
@@ -1241,16 +1465,32 @@ fn openFile(model: *Model, message: OpenFileMessage, fx: *Effects) void {
     activateTab(model, @intCast(slot + 1), fx);
 }
 
+fn collapseEmptyPane(layout: *LayoutState, pane: Pane) void {
+    switch (pane) {
+        .primary => {},
+        .secondary => if (paneCount(layout, .secondary) == 0 and paneCount(layout, .quaternary) == 0) {
+            layout.secondary_child_open = false;
+            layout.secondary_panel_open = false;
+        },
+        .tertiary => {
+            if (paneCount(layout, .tertiary) == 0) layout.primary_child_open = false;
+        },
+        .quaternary => if (paneCount(layout, .quaternary) == 0) {
+            layout.secondary_child_open = false;
+            if (paneCount(layout, .secondary) == 0) layout.secondary_panel_open = false;
+        },
+    }
+}
+
 fn closeTabNow(model: *Model, id: u32) void {
     const layout = model.activeLayout() orelse return;
     const pane = paneForTab(layout, id) orelse return;
     const index = tabIndex(layout, pane, id) orelse return;
     _ = removeTabRaw(layout, pane, index);
     syncPaneActive(layout, pane);
-    if (pane == .secondary and layout.secondary_tab_count == 0) layout.secondary_panel_open = false;
+    collapseEmptyPane(layout, pane);
     if (id <= max_file_tabs) layout.file_tabs[id - 1] = .{};
-    model.primary_reload_token +%= 1;
-    model.secondary_reload_token +%= 1;
+    bumpAllEditorReloads(model);
     syncUrls(model);
 }
 
@@ -1261,21 +1501,14 @@ fn closeOtherTabsNow(model: *Model, id: u32, fx: *Effects) void {
     for (old_order) |candidate| {
         if (candidate <= max_file_tabs and candidate != id) layout.file_tabs[candidate - 1] = .{};
     }
-    if (pane == .primary) {
-        layout.primary_order = [_]u8{0} ** max_tabs;
-        layout.primary_order[0] = @intCast(id);
-        layout.primary_tab_count = 1;
-    } else {
-        layout.secondary_order = [_]u8{0} ** max_tabs;
-        layout.secondary_order[0] = @intCast(id);
-        layout.secondary_tab_count = 1;
-        layout.secondary_panel_open = true;
-    }
+    const pane_index = paneIndex(pane);
+    layout.pane_orders[pane_index] = [_]u8{0} ** max_tabs;
+    layout.pane_orders[pane_index][0] = @intCast(id);
+    layout.pane_tab_counts[pane_index] = 1;
     setPaneActive(layout, pane, @intCast(id));
     layout.active_pane = pane;
     if (id == 9 or id == 10) ensureTerminal(model, @intCast(id - 9), fx);
-    model.primary_reload_token +%= 1;
-    model.secondary_reload_token +%= 1;
+    bumpAllEditorReloads(model);
     syncUrls(model);
 }
 
@@ -1284,18 +1517,12 @@ fn closeAllTabsInPane(model: *Model, pane: Pane) void {
     for (paneOrder(layout, pane)) |candidate| {
         if (candidate <= max_file_tabs) layout.file_tabs[candidate - 1] = .{};
     }
-    if (pane == .primary) {
-        layout.primary_order = [_]u8{0} ** max_tabs;
-        layout.primary_tab_count = 0;
-        layout.primary_active_tab = 0;
-    } else {
-        layout.secondary_order = [_]u8{0} ** max_tabs;
-        layout.secondary_tab_count = 0;
-        layout.secondary_active_tab = 0;
-        layout.secondary_panel_open = false;
-    }
-    model.primary_reload_token +%= 1;
-    model.secondary_reload_token +%= 1;
+    const pane_index = paneIndex(pane);
+    layout.pane_orders[pane_index] = [_]u8{0} ** max_tabs;
+    layout.pane_tab_counts[pane_index] = 0;
+    layout.pane_active_tabs[pane_index] = 0;
+    collapseEmptyPane(layout, pane);
+    bumpAllEditorReloads(model);
     syncUrls(model);
 }
 
@@ -1315,7 +1542,7 @@ fn beginClosePrompt(model: *Model, id: u8, intent: CloseIntent, source_id: u8, p
     if (layout.file_tabs[id - 1].kind == .markdown) layout.file_tabs[id - 1].markdown_editor_visible = true;
     setPaneActive(layout, target_pane, id);
     layout.active_pane = target_pane;
-    if (target_pane == .primary) model.primary_reload_token +%= 1 else model.secondary_reload_token +%= 1;
+    bumpEditorReload(model, target_pane);
     model.pending_close_project_id = model.active_project_id;
     model.pending_close_tab_id = id;
     model.pending_close_source_id = source_id;
@@ -1386,7 +1613,7 @@ fn completePendingClose(model: *Model, fx: *Effects) void {
 
 fn openTerminalIn(model: *Model, pane_id: u32, fx: *Effects) void {
     const layout = model.activeLayout() orelse return;
-    const pane: Pane = if (pane_id == 2) .secondary else .primary;
+    const pane = paneFromId(pane_id) orelse return;
     for (paneOrder(layout, pane)) |id| {
         if (id == 9 or id == 10) {
             layout.active_pane = pane;
@@ -1399,15 +1626,72 @@ fn openTerminalIn(model: *Model, pane_id: u32, fx: *Effects) void {
     activateTab(model, id, fx);
 }
 
-fn dragDestination(model: *Model, event: TabDragMessage) Pane {
-    const layout = model.activeLayout() orelse return .primary;
+const PaneRect = struct {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+};
+
+fn workspaceRect(model: *const Model, event: TabDragMessage) PaneRect {
+    const layout = model.activeLayoutConst();
     const sidebar_width = event.viewWidth * model.project_sidebar_fraction;
     const content_width = @max(@as(f32, 1), event.viewWidth - sidebar_width);
-    const explorer_width = if (layout.explorer_open) content_width * layout.explorer_fraction else 0;
-    const workspace_x = sidebar_width + explorer_width;
-    const workspace_width = @max(@as(f32, 1), event.viewWidth - workspace_x);
+    const explorer_width = if (layout != null and layout.?.explorer_open) content_width * layout.?.explorer_fraction else 0;
+    const x = sidebar_width + explorer_width;
+    return .{
+        .x = x,
+        .y = workspace_chrome_height,
+        .width = @max(@as(f32, 1), event.viewWidth - x),
+        .height = @max(@as(f32, 1), event.viewHeight - workspace_chrome_height),
+    };
+}
+
+fn rootBranchRect(layout: *const LayoutState, primary_branch: bool, workspace: PaneRect) PaneRect {
+    if (!layout.secondary_panel_open) return workspace;
+    if (layout.split_mode == .vertical) {
+        const primary_width = workspace.width * layout.split_fraction;
+        return if (primary_branch)
+            .{ .x = workspace.x, .y = workspace.y, .width = primary_width, .height = workspace.height }
+        else
+            .{ .x = workspace.x + primary_width, .y = workspace.y, .width = workspace.width - primary_width, .height = workspace.height };
+    }
+    const available = @max(@as(f32, 1), workspace.height - horizontal_split_divider_height);
+    const primary_height = available * layout.split_fraction;
+    return if (primary_branch)
+        .{ .x = workspace.x, .y = workspace.y, .width = workspace.width, .height = primary_height }
+    else
+        .{ .x = workspace.x, .y = workspace.y + primary_height + horizontal_split_divider_height, .width = workspace.width, .height = available - primary_height };
+}
+
+fn leafRect(layout: *const LayoutState, pane: Pane, workspace: PaneRect) PaneRect {
+    const primary_branch = pane == .primary or pane == .tertiary;
+    const branch = rootBranchRect(layout, primary_branch, workspace);
+    const child_open = if (primary_branch) layout.primary_child_open else layout.secondary_child_open;
+    if (!child_open) return branch;
+    const child_mode = if (primary_branch) layout.primary_child_mode else layout.secondary_child_mode;
+    const child_fraction = if (primary_branch) layout.primary_child_fraction else layout.secondary_child_fraction;
+    const first_child = pane == .primary or pane == .secondary;
+    if (child_mode == .vertical) {
+        const first_width = branch.width * child_fraction;
+        return if (first_child)
+            .{ .x = branch.x, .y = branch.y, .width = first_width, .height = branch.height }
+        else
+            .{ .x = branch.x + first_width, .y = branch.y, .width = branch.width - first_width, .height = branch.height };
+    }
+    const available = @max(@as(f32, 1), branch.height - horizontal_split_divider_height);
+    const first_height = available * child_fraction;
+    return if (first_child)
+        .{ .x = branch.x, .y = branch.y, .width = branch.width, .height = first_height }
+    else
+        .{ .x = branch.x, .y = branch.y + first_height + horizontal_split_divider_height, .width = branch.width, .height = available - first_height };
+}
+
+fn dragDestination(model: *Model, event: TabDragMessage) Pane {
+    const layout = model.activeLayout() orelse return .primary;
+    const workspace = workspaceRect(model, event);
     if (!layout.secondary_panel_open) {
-        if (event.x > workspace_x + workspace_width * 0.72) {
+        if (event.x > workspace.x + workspace.width * 0.72) {
             layout.secondary_panel_open = true;
             layout.split_mode = .vertical;
             return .secondary;
@@ -1419,29 +1703,27 @@ fn dragDestination(model: *Model, event: TabDragMessage) Pane {
         }
         return .primary;
     }
-    return switch (layout.split_mode) {
-        .vertical => if (event.x < workspace_x + workspace_width * layout.split_fraction) .primary else .secondary,
-        .horizontal => if (event.y < 42 + (event.viewHeight - 42) * layout.split_fraction) .primary else .secondary,
+    const in_primary_branch = switch (layout.split_mode) {
+        .vertical => event.x < workspace.x + workspace.width * layout.split_fraction,
+        .horizontal => event.y < rootBranchRect(layout, true, workspace).y + rootBranchRect(layout, true, workspace).height,
     };
+    const branch = rootBranchRect(layout, in_primary_branch, workspace);
+    const child_open = if (in_primary_branch) layout.primary_child_open else layout.secondary_child_open;
+    if (!child_open) return if (in_primary_branch) .primary else .secondary;
+    const child_mode = if (in_primary_branch) layout.primary_child_mode else layout.secondary_child_mode;
+    const child_fraction = if (in_primary_branch) layout.primary_child_fraction else layout.secondary_child_fraction;
+    const in_first_child = switch (child_mode) {
+        .vertical => event.x < branch.x + branch.width * child_fraction,
+        .horizontal => event.y < branch.y + (@max(@as(f32, 1), branch.height - horizontal_split_divider_height) * child_fraction),
+    };
+    if (in_primary_branch) return if (in_first_child) .primary else .tertiary;
+    return if (in_first_child) .secondary else .quaternary;
 }
 
 fn dragInsertionIndex(model: *const Model, pane: Pane, event: TabDragMessage) usize {
     const layout = model.activeLayoutConst() orelse return 0;
-    const sidebar_width = event.viewWidth * model.project_sidebar_fraction;
-    const content_width = @max(@as(f32, 1), event.viewWidth - sidebar_width);
-    const explorer_width = if (layout.explorer_open) content_width * layout.explorer_fraction else 0;
-    const workspace_x = sidebar_width + explorer_width;
-    const workspace_width = @max(@as(f32, 1), event.viewWidth - workspace_x);
-    var origin = workspace_x;
-    var width = workspace_width;
-    if (layout.secondary_panel_open and layout.split_mode == .vertical) {
-        const primary_width = workspace_width * layout.split_fraction;
-        if (pane == .primary) width = primary_width else {
-            origin += primary_width;
-            width -= primary_width;
-        }
-    }
-    const fraction = std.math.clamp((event.x - origin) / @max(@as(f32, 1), width), 0, 0.98);
+    const rect = leafRect(layout, pane, workspaceRect(model, event));
+    const fraction = std.math.clamp((event.x - rect.x) / @max(@as(f32, 1), rect.width), 0, 0.98);
     return @intFromFloat(@floor(fraction * @as(f32, @floatFromInt(paneCount(layout, pane) + 1))));
 }
 
@@ -1456,10 +1738,9 @@ fn completeTabDrop(model: *Model, event: TabDragMessage, fx: *Effects) void {
     insertTabRaw(layout, destination, @intCast(id), dragInsertionIndex(model, destination, event));
     setPaneActive(layout, destination, @intCast(id));
     layout.active_pane = destination;
-    if (source == .secondary and destination != .secondary and layout.secondary_tab_count == 0) layout.secondary_panel_open = false;
+    collapseEmptyPane(layout, source);
     if (id == 9 or id == 10) ensureTerminal(model, @intCast(id - 9), fx);
-    model.primary_reload_token +%= 1;
-    model.secondary_reload_token +%= 1;
+    bumpAllEditorReloads(model);
     syncUrls(model);
 }
 
@@ -1475,14 +1756,101 @@ fn handleTabDrag(model: *Model, event: TabDragMessage, fx: *Effects) void {
     }
 }
 
-fn setSplit(model: *Model, mode: SplitMode) void {
+fn setSplit(model: *Model, pane_id: u32, mode: SplitMode) void {
     const layout = model.activeLayout() orelse return;
-    layout.split_mode = mode;
-    layout.secondary_panel_open = true;
+    const pane = paneFromId(pane_id) orelse return;
+    if (!layout.secondary_panel_open) {
+        layout.split_mode = mode;
+        layout.secondary_panel_open = true;
+        return;
+    }
+    switch (pane) {
+        .primary => if (!layout.primary_child_open) {
+            layout.primary_child_mode = mode;
+            layout.primary_child_open = true;
+        },
+        .secondary => if (!layout.secondary_child_open) {
+            layout.secondary_child_mode = mode;
+            layout.secondary_child_open = true;
+        },
+        .tertiary, .quaternary => {},
+    }
+}
+
+fn horizontalSplitFraction(event: TabDragMessage) ?f32 {
+    if (!std.math.isFinite(event.y) or !std.math.isFinite(event.viewHeight)) return null;
+    const available = event.viewHeight - workspace_chrome_height - horizontal_split_divider_height;
+    if (!(available > 0)) return null;
+
+    const min_fraction = @min(@as(f32, 0.45), horizontal_split_min_pane_height / available);
+    const max_fraction = 1 - min_fraction;
+    const requested = (event.y - workspace_chrome_height - horizontal_split_divider_height * 0.5) / available;
+    return std.math.clamp(requested, min_fraction, max_fraction);
+}
+
+fn handleHorizontalSplitDrag(model: *Model, event: TabDragMessage) void {
+    const layout = model.activeLayout() orelse return;
+    switch (event.phase) {
+        0 => {
+            if (!layout.split_drag_active) {
+                layout.split_drag_origin = layout.split_fraction;
+                layout.split_drag_active = true;
+            }
+            if (horizontalSplitFraction(event)) |fraction| layout.split_fraction = fraction;
+        },
+        1 => {
+            if (horizontalSplitFraction(event)) |fraction| layout.split_fraction = fraction;
+            layout.split_drag_active = false;
+        },
+        2 => {
+            if (layout.split_drag_active) layout.split_fraction = layout.split_drag_origin;
+            layout.split_drag_active = false;
+        },
+        else => {},
+    }
+}
+
+fn branchHorizontalSplitFraction(model: *const Model, pane: Pane, event: TabDragMessage) ?f32 {
+    if (!std.math.isFinite(event.y) or !std.math.isFinite(event.viewHeight)) return null;
+    const layout = model.activeLayoutConst() orelse return null;
+    const primary_branch = pane == .primary;
+    const branch = rootBranchRect(layout, primary_branch, workspaceRect(model, event));
+    const available = branch.height - horizontal_split_divider_height;
+    if (!(available > 0)) return null;
+    const min_fraction = @min(@as(f32, 0.45), horizontal_split_min_pane_height / available);
+    const requested = (event.y - branch.y - horizontal_split_divider_height * 0.5) / available;
+    return std.math.clamp(requested, min_fraction, 1 - min_fraction);
+}
+
+fn handleBranchHorizontalSplitDrag(model: *Model, pane: Pane, event: TabDragMessage) void {
+    if (pane != .primary and pane != .secondary) return;
+    const fraction = branchHorizontalSplitFraction(model, pane, event);
+    const layout = model.activeLayout() orelse return;
+    const current = if (pane == .primary) &layout.primary_child_fraction else &layout.secondary_child_fraction;
+    const origin = if (pane == .primary) &layout.primary_child_drag_origin else &layout.secondary_child_drag_origin;
+    const active = if (pane == .primary) &layout.primary_child_drag_active else &layout.secondary_child_drag_active;
+    switch (event.phase) {
+        0 => {
+            if (!active.*) {
+                origin.* = current.*;
+                active.* = true;
+            }
+            if (fraction) |value| current.* = value;
+        },
+        1 => {
+            if (fraction) |value| current.* = value;
+            active.* = false;
+        },
+        2 => {
+            if (active.*) current.* = origin.*;
+            active.* = false;
+        },
+        else => {},
+    }
 }
 
 fn toggleMarkdownSurface(model: *Model, pane_id: u32, editor: bool) void {
-    const pane: Pane = if (pane_id == 2) .secondary else .primary;
+    const pane = paneFromId(pane_id) orelse return;
     const layout = model.activeLayout() orelse return;
     const slot = activeFileSlot(layout, pane) orelse return;
     const tab = &layout.file_tabs[slot];
@@ -1623,6 +1991,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .split_resized => |fraction| if (model.activeLayout()) |layout| {
             layout.split_fraction = fraction;
         },
+        .horizontal_split_dragged => |event| handleHorizontalSplitDrag(model, event),
+        .primary_child_resized => |fraction| if (model.activeLayout()) |layout| {
+            layout.primary_child_fraction = fraction;
+        },
+        .secondary_child_resized => |fraction| if (model.activeLayout()) |layout| {
+            layout.secondary_child_fraction = fraction;
+        },
+        .primary_branch_horizontal_split_dragged => |event| handleBranchHorizontalSplitDrag(model, .primary, event),
+        .secondary_branch_horizontal_split_dragged => |event| handleBranchHorizontalSplitDrag(model, .secondary, event),
         .markdown_resized => |fraction| if (model.activeLayout()) |layout| {
             layout.markdown_fraction = fraction;
         },
@@ -1646,8 +2023,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .copy_relative_path => |id| copyTabPath(model, id, false, fx),
         .reveal_in_finder => |id| fx.hostSend("native-sdk.os.revealPath", fullPathForTab(model, id)),
         .open_terminal_in => |pane_id| openTerminalIn(model, pane_id, fx),
-        .split_horizontal => setSplit(model, .horizontal),
-        .split_vertical => setSplit(model, .vertical),
+        .split_horizontal => |pane_id| setSplit(model, pane_id, .horizontal),
+        .split_vertical => |pane_id| setSplit(model, pane_id, .vertical),
         .select_project => |project_id| {
             model.project_menu_open = false;
             model.project_menu_id = 0;
@@ -1729,6 +2106,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 }
             }
         },
+        .remove_recent_project => |recent_id| {
+            if (recent_id > 0) removeRecentProjectAt(model, @intCast(recent_id - 1));
+        },
         .directory_selected => |path| if (addProject(model, path)) |project_id| {
             model.add_project_open = false;
             model.directory_picker_requested = false;
@@ -1747,8 +2127,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 .set_theme_dark => .dark,
                 else => .system,
             };
-            model.primary_reload_token +%= 1;
-            model.secondary_reload_token +%= 1;
+            bumpAllEditorReloads(model);
             model.tree_reload_token +%= 1;
             syncUrls(model);
         },
@@ -1756,6 +2135,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .toggle_primary_markdown_preview => toggleMarkdownSurface(model, 1, false),
         .toggle_secondary_markdown_editor => toggleMarkdownSurface(model, 2, true),
         .toggle_secondary_markdown_preview => toggleMarkdownSurface(model, 2, false),
+        .toggle_tertiary_markdown_editor => toggleMarkdownSurface(model, 3, true),
+        .toggle_tertiary_markdown_preview => toggleMarkdownSurface(model, 3, false),
+        .toggle_quaternary_markdown_editor => toggleMarkdownSurface(model, 4, true),
+        .toggle_quaternary_markdown_preview => toggleMarkdownSurface(model, 4, false),
         .toggle_markdown_editor => |pane_id| toggleMarkdownSurface(model, pane_id, true),
         .toggle_markdown_preview => |pane_id| toggleMarkdownSurface(model, pane_id, false),
         .open_file => |message| openFile(model, message, fx),
@@ -1801,6 +2184,16 @@ fn modalOpen(model: *const Model) bool {
     return model.add_project_open or model.settings_open or model.close_confirmation_open or model.rename_project_open or model.project_menu_open or model.project_switching;
 }
 
+fn paneVisible(model: *const Model, pane: Pane) bool {
+    const layout = model.activeLayoutConst() orelse return false;
+    return switch (pane) {
+        .primary => true,
+        .secondary => layout.secondary_panel_open,
+        .tertiary => layout.secondary_panel_open and layout.primary_child_open,
+        .quaternary => layout.secondary_panel_open and layout.secondary_child_open,
+    };
+}
+
 pub fn webPanes(model: *const Model, out: []DocyrusApp.WebViewPane) usize {
     out[0] = if (!modalOpen(model) and paneUsesEditor(model, .primary)) .{
         .label = primary_editor_view_label,
@@ -1816,13 +2209,27 @@ pub fn webPanes(model: *const Model, out: []DocyrusApp.WebViewPane) usize {
         .reload_token = model.secondary_reload_token,
     } else parkedPane(secondary_editor_view_label, model.secondaryEditorUrl(), model.secondary_reload_token);
 
-    out[2] = if (!modalOpen(model) and model.explorer_open()) .{
+    out[2] = if (!modalOpen(model) and paneVisible(model, .tertiary) and paneUsesEditor(model, .tertiary)) .{
+        .label = tertiary_editor_view_label,
+        .anchor = tertiary_editor_pane_anchor,
+        .url = model.tertiaryEditorUrl(),
+        .reload_token = model.tertiary_reload_token,
+    } else parkedPane(tertiary_editor_view_label, model.tertiaryEditorUrl(), model.tertiary_reload_token);
+
+    out[3] = if (!modalOpen(model) and paneVisible(model, .quaternary) and paneUsesEditor(model, .quaternary)) .{
+        .label = quaternary_editor_view_label,
+        .anchor = quaternary_editor_pane_anchor,
+        .url = model.quaternaryEditorUrl(),
+        .reload_token = model.quaternary_reload_token,
+    } else parkedPane(quaternary_editor_view_label, model.quaternaryEditorUrl(), model.quaternary_reload_token);
+
+    out[4] = if (!modalOpen(model) and model.explorer_open()) .{
         .label = tree_view_label,
         .anchor = tree_pane_anchor,
         .url = model.treeUrl(),
         .reload_token = model.tree_reload_token,
     } else parkedPane(tree_view_label, model.treeUrl(), model.tree_reload_token);
-    return 3;
+    return 5;
 }
 
 fn themeState(model: *const Model) DocyrusApp.ThemeState {
@@ -1840,17 +2247,17 @@ test "each project owns an independent empty layout" {
     syncUrls(&model);
     var fx: Effects = undefined;
     openFile(&model, .{ .project_id = first, .path = "README.md", .markdown = "# One" }, &fx);
-    try std.testing.expectEqual(@as(u8, 1), model.projects[0].layout.primary_tab_count);
+    try std.testing.expectEqual(@as(u8, 1), paneCount(&model.projects[0].layout, .primary));
 
     const second = addProject(&model, "/tmp/project-two").?;
     selectProject(&model, second);
     update(&model, .finish_project_switch, &fx);
-    try std.testing.expectEqual(@as(u8, 0), model.projects[1].layout.primary_tab_count);
+    try std.testing.expectEqual(@as(u8, 0), paneCount(&model.projects[1].layout, .primary));
     try std.testing.expectEqualStrings("/tmp/project-two", model.workspace_path());
 
     selectProject(&model, first);
     update(&model, .finish_project_switch, &fx);
-    try std.testing.expectEqual(@as(u8, 1), model.projects[0].layout.primary_tab_count);
+    try std.testing.expectEqual(@as(u8, 1), paneCount(&model.projects[0].layout, .primary));
     try std.testing.expectEqualStrings("# One", model.primary_markdown_body());
 }
 
@@ -1890,7 +2297,7 @@ test "Other Open Files tree keeps directly opened files after tabs close" {
 
     closeTabNow(&model, 1);
     closeTabNow(&model, 2);
-    try std.testing.expectEqual(@as(u8, 0), external.layout.primary_tab_count);
+    try std.testing.expectEqual(@as(u8, 0), paneCount(&external.layout, .primary));
 
     var output: [4096]u8 = undefined;
     const json = try writeExternalTreeJson(&model, 0, &output);
@@ -1906,11 +2313,92 @@ test "tab dragging mutates only when the drop completes" {
     var fx: Effects = undefined;
     openFile(&model, .{ .project_id = 1, .path = "one.zig" }, &fx);
     openFile(&model, .{ .project_id = 1, .path = "two.zig" }, &fx);
-    const before = model.projects[0].layout.primary_order;
+    const before = model.projects[0].layout.pane_orders[paneIndex(.primary)];
     handleTabDrag(&model, .{ .sourceId = 2, .phase = 0, .x = 1100, .y = 60, .viewWidth = 1200, .viewHeight = 800 }, &fx);
-    try std.testing.expectEqualSlices(u8, &before, &model.projects[0].layout.primary_order);
+    try std.testing.expectEqualSlices(u8, &before, &model.projects[0].layout.pane_orders[paneIndex(.primary)]);
     handleTabDrag(&model, .{ .sourceId = 2, .phase = 1, .x = 1100, .y = 60, .viewWidth = 1200, .viewHeight = 800 }, &fx);
     try std.testing.expectEqual(Pane.secondary, paneForTab(&model.projects[0].layout, 2).?);
+}
+
+test "horizontal split drag resizes height and restores on cancellation" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    const layout = model.activeLayout().?;
+    layout.secondary_panel_open = true;
+    layout.split_mode = .horizontal;
+
+    handleHorizontalSplitDrag(&model, .{ .phase = 0, .y = 300, .viewHeight = 800 });
+    try std.testing.expectApproxEqAbs(@as(f32, 252.5 / 748.0), layout.split_fraction, 0.0001);
+    try std.testing.expect(layout.split_drag_active);
+
+    handleHorizontalSplitDrag(&model, .{ .phase = 2, .y = 300, .viewHeight = 800 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.58), layout.split_fraction, 0.0001);
+    try std.testing.expect(!layout.split_drag_active);
+
+    handleHorizontalSplitDrag(&model, .{ .phase = 0, .y = 740, .viewHeight = 800 });
+    try std.testing.expectApproxEqAbs(@as(f32, 608.0 / 748.0), layout.split_fraction, 0.0001);
+    handleHorizontalSplitDrag(&model, .{ .phase = 1, .y = 740, .viewHeight = 800 });
+    try std.testing.expectApproxEqAbs(@as(f32, 608.0 / 748.0), layout.split_fraction, 0.0001);
+    try std.testing.expect(!layout.split_drag_active);
+}
+
+test "workspace splits are bounded to two levels" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    var fx: Effects = undefined;
+
+    update(&model, .{ .split_horizontal = 1 }, &fx);
+    const layout = model.activeLayout().?;
+    try std.testing.expect(layout.secondary_panel_open);
+    try std.testing.expectEqual(SplitMode.horizontal, layout.split_mode);
+
+    update(&model, .{ .split_vertical = 2 }, &fx);
+    try std.testing.expect(layout.secondary_child_open);
+    try std.testing.expectEqual(SplitMode.vertical, layout.secondary_child_mode);
+
+    update(&model, .{ .split_horizontal = 1 }, &fx);
+    try std.testing.expect(layout.primary_child_open);
+    try std.testing.expectEqual(SplitMode.horizontal, layout.primary_child_mode);
+
+    update(&model, .{ .split_vertical = 3 }, &fx);
+    update(&model, .{ .split_horizontal = 4 }, &fx);
+    try std.testing.expectEqual(SplitMode.horizontal, layout.primary_child_mode);
+    try std.testing.expectEqual(SplitMode.vertical, layout.secondary_child_mode);
+}
+
+test "nested horizontal split drag uses its branch bounds" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    const layout = model.activeLayout().?;
+    layout.secondary_panel_open = true;
+    layout.split_mode = .horizontal;
+    layout.split_fraction = 0.5;
+    layout.secondary_child_open = true;
+    layout.secondary_child_mode = .horizontal;
+
+    handleBranchHorizontalSplitDrag(&model, .secondary, .{ .phase = 0, .y = 600, .viewWidth = 1200, .viewHeight = 800 });
+    try std.testing.expectApproxEqAbs(@as(f32, 169.5 / 365.0), layout.secondary_child_fraction, 0.0001);
+    try std.testing.expect(layout.secondary_child_drag_active);
+
+    handleBranchHorizontalSplitDrag(&model, .secondary, .{ .phase = 2, .y = 600, .viewWidth = 1200, .viewHeight = 800 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), layout.secondary_child_fraction, 0.0001);
+    try std.testing.expect(!layout.secondary_child_drag_active);
+}
+
+test "tabs can occupy all four split leaves" {
+    var layout: LayoutState = .{};
+    layout.secondary_panel_open = true;
+    layout.primary_child_open = true;
+    layout.secondary_child_open = true;
+    insertTabRaw(&layout, .primary, 1, 0);
+    insertTabRaw(&layout, .secondary, 2, 0);
+    insertTabRaw(&layout, .tertiary, 3, 0);
+    insertTabRaw(&layout, .quaternary, 4, 0);
+
+    try std.testing.expectEqual(Pane.primary, paneForTab(&layout, 1).?);
+    try std.testing.expectEqual(Pane.secondary, paneForTab(&layout, 2).?);
+    try std.testing.expectEqual(Pane.tertiary, paneForTab(&layout, 3).?);
+    try std.testing.expectEqual(Pane.quaternary, paneForTab(&layout, 4).?);
 }
 
 test "project sidebar defaults to 200 points and home paths use tilde" {
@@ -2042,7 +2530,7 @@ test "dirty file tabs require confirmation and save before closing" {
     try std.testing.expect(tabs[0].dirty);
     update(&model, .{ .close_tab = 1 }, &fx);
     try std.testing.expect(model.close_confirmation_open);
-    try std.testing.expectEqual(@as(u8, 1), model.projects[0].layout.primary_tab_count);
+    try std.testing.expectEqual(@as(u8, 1), paneCount(&model.projects[0].layout, .primary));
 
     update(&model, .cancel_close_tab, &fx);
     try std.testing.expect(!model.close_confirmation_open);
@@ -2053,7 +2541,7 @@ test "dirty file tabs require confirmation and save before closing" {
     try std.testing.expectEqual(EditorAction.save_and_close, model.pending_editor_action);
     update(&model, .{ .markdown_saved = .{ .project_id = 1, .slot = 1, .content = "saved", .close_after_save = true } }, &fx);
     try std.testing.expect(!model.close_confirmation_open);
-    try std.testing.expectEqual(@as(u8, 0), model.projects[0].layout.primary_tab_count);
+    try std.testing.expectEqual(@as(u8, 0), paneCount(&model.projects[0].layout, .primary));
 }
 
 test "markdown editor and preview toggles always leave one surface visible" {
@@ -2078,7 +2566,7 @@ test "modals and project switches park every child webview" {
     model.active_project_id = addProject(&model, "/tmp/project").?;
     syncUrls(&model);
     model.settings_open = true;
-    var panes: [3]DocyrusApp.WebViewPane = undefined;
+    var panes: [5]DocyrusApp.WebViewPane = undefined;
     _ = webPanes(&model, &panes);
     for (panes) |pane| {
         try std.testing.expectEqual(@as(f32, 1), pane.frame.width);
@@ -2096,6 +2584,27 @@ test "recent projects use a ten item MRU" {
     try std.testing.expectEqual(@as(u8, 10), model.recent_count);
     try std.testing.expectEqualStrings("/tmp/recent-11", model.recent_projects[0].path());
     try std.testing.expectEqualStrings("/tmp/recent-2", model.recent_projects[9].path());
+}
+
+test "recent projects can be removed by their chooser id" {
+    var model: Model = .{};
+    addRecentProject(&model, "/tmp/first");
+    addRecentProject(&model, "/tmp/second");
+    addRecentProject(&model, "/tmp/third");
+    _ = addProject(&model, "/tmp/second").?;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const recent = model.recentProjects(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 2), recent.len);
+    try std.testing.expectEqual(@as(u32, 3), recent[1].id);
+
+    var fx: Effects = undefined;
+    update(&model, .{ .remove_recent_project = recent[1].id }, &fx);
+
+    try std.testing.expectEqual(@as(u8, 2), model.recent_count);
+    try std.testing.expectEqualStrings("/tmp/second", model.recent_projects[0].path());
+    try std.testing.expectEqualStrings("/tmp/third", model.recent_projects[1].path());
 }
 
 test "file tree reads only the selected absolute project root" {
@@ -2257,6 +2766,28 @@ const shell_views = [_]native_sdk.ShellView{
     },
     .{
         .label = secondary_editor_view_label,
+        .kind = .webview,
+        .parent = canvas_label,
+        .x = 0,
+        .y = 0,
+        .width = 1,
+        .height = 1,
+        .layer = 20,
+        .url = "zero://app/index.html?project=0&slot=0&theme=system",
+    },
+    .{
+        .label = tertiary_editor_view_label,
+        .kind = .webview,
+        .parent = canvas_label,
+        .x = 0,
+        .y = 0,
+        .width = 1,
+        .height = 1,
+        .layer = 20,
+        .url = "zero://app/index.html?project=0&slot=0&theme=system",
+    },
+    .{
+        .label = quaternary_editor_view_label,
         .kind = .webview,
         .parent = canvas_label,
         .x = 0,
@@ -2608,7 +3139,10 @@ const AppHost = struct {
 };
 
 fn isEditorView(label: []const u8) bool {
-    return std.mem.eql(u8, label, primary_editor_view_label) or std.mem.eql(u8, label, secondary_editor_view_label);
+    return std.mem.eql(u8, label, primary_editor_view_label) or
+        std.mem.eql(u8, label, secondary_editor_view_label) or
+        std.mem.eql(u8, label, tertiary_editor_view_label) or
+        std.mem.eql(u8, label, quaternary_editor_view_label);
 }
 
 fn ignoredDirectory(name: []const u8) bool {
