@@ -1,0 +1,22 @@
+Docyrus Open IDE
+Copyright 2026 Docyrus
+
+This product includes software developed at Docyrus.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+---
+
+This product bundles or depends on third-party software:
+
+- Native SDK (@native-sdk/cli, @native-sdk/core) — Apache License 2.0
+- Monaco Editor (monaco-editor), vendored under frontend/dist/vs — MIT License
+- @pierre/trees — Apache License 2.0
+- Ghostty (terminal backend, fetched at build time) — MIT License
+- Zig toolchain (build-time only) — MIT License
+
+Each retains its own copyright and license terms.

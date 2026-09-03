@@ -1,0 +1,22 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    reviewers:
+      - Docyrus/system
+    # The SDK is patched by scripts/patch-native-sdk-pointer.mjs and Monaco is
+    # vendored under frontend/dist/vs, so both need a human upgrade, not a bump.
+    ignore:
+      - dependency-name: "@native-sdk/cli"
+      - dependency-name: "@native-sdk/core"
+      - dependency-name: "monaco-editor"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    reviewers:
+      - Docyrus/system

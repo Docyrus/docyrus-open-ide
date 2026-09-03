@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: build and test
+    # Apple Silicon runner: the app is macOS arm64 only.
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      # The SDK fetches its pinned Zig 0.16 toolchain into ~/.native/toolchains
+      # on first build, and Ghostty into the project package cache. Both are
+      # slow and version-pinned, so cache them on the lockfile + manifest.
+      - name: Cache Zig toolchain and packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.native/toolchains
+            zig-pkg
+          key: native-${{ runner.os }}-${{ hashFiles('package-lock.json', 'build.zig.zon') }}
+          restore-keys: |
+            native-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify frontend/dist/tree.js is up to date
+        run: |
+          npm run bundle:tree
+          if ! git diff --exit-code -- frontend/dist/tree.js; then
+            echo "::error file=frontend/dist/tree.js::Committed bundle is stale. Run 'npm run bundle:tree' and commit the result."
+            exit 1
+          fi
+
+      - name: Check
+        run: npm run check
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build

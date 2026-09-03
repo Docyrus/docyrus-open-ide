@@ -1,5 +1,8 @@
 # Docyrus Open IDE
 
+[![CI](https://github.com/Docyrus/docyrus-open-ide/actions/workflows/ci.yml/badge.svg)](https://github.com/Docyrus/docyrus-open-ide/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 Docyrus Open IDE is a lightweight macOS workspace built with the Native SDK. It combines native project and pane chrome with a local Monaco editor, native Markdown and image previews, native PTY terminals, and an `@pierre/trees` File Explorer.
 
 ## Install
@@ -24,7 +27,7 @@ The installer places `Docyrus Open IDE.app` in `/Applications`, clears the downl
 
 ## Develop
 
-Install JavaScript dependencies and run the native development command. The npm scripts use the Native SDK-managed Zig 0.16 toolchain when it is installed in its standard location:
+You need macOS on Apple Silicon, Node.js 24 or newer, and the Xcode Command Line Tools. You do not need to install Zig: the Native SDK fetches its pinned Zig 0.16 toolchain into `~/.native/toolchains/` on the first build, and the npm scripts put it on `PATH`.
 
 ```sh
 npm install
@@ -42,3 +45,27 @@ npm run build
 ```
 
 The app deliberately starts without an open project. Use the plus button in the project rail to select a folder.
+
+## Contributing
+
+Contributions are currently accepted from members of the
+[Docyrus organization](https://github.com/Docyrus). The repository is public to
+read, install, and file issues against; pull requests are merged from org
+members while the project settles.
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the verification commands,
+and the pull request process, and [`.ruler/AGENTS.md`](.ruler/AGENTS.md) for the
+codebase invariants (generated files, fixed-size model state, and the
+bridge-command checklist).
+
+By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Security
+
+Report vulnerabilities privately — see [SECURITY.md](SECURITY.md). Do not open a
+public issue for a security problem.
+
+## License
+
+[Apache License 2.0](LICENSE). Third-party components and their licenses are
+listed in [NOTICE](NOTICE).

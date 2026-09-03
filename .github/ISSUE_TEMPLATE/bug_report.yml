@@ -1,0 +1,63 @@
+name: Bug report
+description: Something in Docyrus Open IDE does not work
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. For security vulnerabilities, use
+        [private reporting](https://github.com/Docyrus/docyrus-open-ide/security/advisories/new)
+        instead of this form.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Add project folder '...'
+        2. Open 'src/main.zig' in the explorer
+        3. Split the pane vertically
+        4. See error
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: App version
+      description: From the app's About dialog, or the `version` field in `app.json`.
+      placeholder: "0.1.2"
+    validations:
+      required: true
+  - type: input
+    id: macos-version
+    attributes:
+      label: macOS version and chip
+      placeholder: "15.2, M2 Pro"
+    validations:
+      required: true
+  - type: dropdown
+    id: install-source
+    attributes:
+      label: How did you get the app?
+      options:
+        - Installed a release (install-mac.sh or .dmg)
+        - Built from source (npm run dev)
+        - Built from source (npm run build)
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Relevant lines from `~/Library/Logs/dev.native_sdk.app/native-sdk.jsonl`.
+        This is rendered as a code block, so no backticks needed.
+      render: text
+    validations:
+      required: false
