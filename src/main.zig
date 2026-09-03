@@ -28,7 +28,6 @@ const relative_path_capacity: usize = 768;
 const title_capacity: usize = 160;
 const markdown_capacity: usize = 32 * 1024;
 const bridge_file_limit: usize = 768 * 1024;
-const bridge_tree_limit: usize = 1200;
 const bridge_tree_page_limit: usize = 160;
 // Bridge handler results are capped at 12 KiB. Leave room for the response
 // envelope and JSON metadata so a large project cannot fail as one payload.
@@ -2181,6 +2180,49 @@ test "file tree paginates without losing project entries" {
     try std.testing.expectEqual(bridge_tree_page_limit + 17, total);
 }
 
+test "file tree is not truncated after the former 1200 entry limit" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file_count = 1217;
+    for (0..file_count) |index| {
+        var path_buffer: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buffer, "entry-{d}.txt", .{index});
+        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = path, .data = "test" });
+    }
+    try tmp.dir.createDir(std.testing.io, "apps", .default_dir);
+
+    var root_storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_storage);
+    const root = root_storage[0..root_len];
+    const Payload = struct {
+        paths: []const []const u8,
+        nextOffset: usize,
+        done: bool,
+        truncated: bool,
+    };
+
+    var output: [64 * 1024]u8 = undefined;
+    var offset: usize = 0;
+    var total: usize = 0;
+    var saw_apps = false;
+    while (true) {
+        const json = try writeProjectTreeJson(std.testing.io, root, offset, &output);
+        const parsed = try std.json.parseFromSlice(Payload, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expect(!parsed.value.truncated);
+        for (parsed.value.paths) |path| {
+            if (std.mem.eql(u8, path, "apps/")) saw_apps = true;
+        }
+        total += parsed.value.paths.len;
+        if (parsed.value.done) break;
+        try std.testing.expect(parsed.value.nextOffset > offset);
+        offset = parsed.value.nextOffset;
+    }
+
+    try std.testing.expectEqual(file_count + 1, total);
+    try std.testing.expect(saw_apps);
+}
+
 const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
     native_sdk.security.permission_view,
@@ -2603,7 +2645,6 @@ fn writeExternalTreeJson(model: *const Model, offset: usize, output: []u8) ![]co
 
 fn writeProjectTreeJson(io: std.Io, project_path: []const u8, offset: usize, output: []u8) ![]const u8 {
     if (!std.fs.path.isAbsolute(project_path)) return error.InvalidProjectPath;
-    if (offset > bridge_tree_limit) return error.InvalidTreeOffset;
 
     // Open the selected root explicitly. Never let an empty or relative path
     // fall through to the process working directory inside an app bundle.
@@ -2625,13 +2666,13 @@ fn writeProjectTreeJson(io: std.Io, project_path: []const u8, offset: usize, out
     var skipped: usize = 0;
     var reached_end = false;
     var first = true;
-    while (visited < bridge_tree_limit) {
+    while (true) {
         const entry = walker.next(io) catch {
             // An unreadable descendant must not discard files already found in
-            // the selected project. Return the useful partial tree instead.
+            // the selected project. SelectiveWalker pops the directory that
+            // failed, so its next call can continue with the remaining siblings.
             skipped += 1;
-            reached_end = true;
-            break;
+            continue;
         } orelse {
             reached_end = true;
             break;
@@ -2684,16 +2725,13 @@ fn writeProjectTreeJson(io: std.Io, project_path: []const u8, offset: usize, out
         }
     }
 
-    const next_offset = offset + page_count;
-    const truncated = next_offset >= bridge_tree_limit and !reached_end;
-    const done = reached_end or truncated;
+    const next_offset = std.math.add(usize, offset, page_count) catch return error.InvalidTreeOffset;
 
     try writer.writeAll("],\"nextOffset\":");
     try writer.print("{d}", .{next_offset});
     try writer.writeAll(",\"done\":");
-    try writer.writeAll(if (done) "true" else "false");
-    try writer.writeAll(",\"truncated\":");
-    try writer.writeAll(if (truncated) "true" else "false");
+    try writer.writeAll(if (reached_end) "true" else "false");
+    try writer.writeAll(",\"truncated\":false");
     try writer.writeAll(",\"skipped\":");
     try writer.print("{d}", .{skipped});
     try writer.writeByte('}');
