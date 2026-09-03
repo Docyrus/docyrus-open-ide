@@ -1,22 +1,23 @@
-# Every pull request needs a review from the owning team.
+# Every pull request needs a review from an owning team, and requests
+# @anilbeyazoglu on every path so nothing lands without him seeing it.
 # Ownership is by area; the last matching pattern wins.
 
-*                       @Docyrus/system
+*                       @anilbeyazoglu @Docyrus/system
 
 # Native core, UI markup, and app manifest
-/src/                   @Docyrus/system
-/app.json               @Docyrus/system
-/build.zig              @Docyrus/system
-/build.zig.zon          @Docyrus/system
+/src/                   @anilbeyazoglu @Docyrus/system
+/app.json               @anilbeyazoglu @Docyrus/system
+/build.zig              @anilbeyazoglu @Docyrus/system
+/build.zig.zon          @anilbeyazoglu @Docyrus/system
 
 # WebView frontends: Monaco editor and the file-explorer tree
-/frontend/              @Docyrus/frontend @Docyrus/system
+/frontend/              @anilbeyazoglu @Docyrus/frontend @Docyrus/system
 
 # Repo policy, licensing, CI, and agent instructions
-/LICENSE                @Docyrus/system
-/NOTICE                 @Docyrus/system
-/SECURITY.md            @Docyrus/system
-/CONTRIBUTING.md        @Docyrus/system
-/CODE_OF_CONDUCT.md     @Docyrus/system
-/.github/               @Docyrus/system
-/.ruler/                @Docyrus/system
+/LICENSE                @anilbeyazoglu @Docyrus/system
+/NOTICE                 @anilbeyazoglu @Docyrus/system
+/SECURITY.md            @anilbeyazoglu @Docyrus/system
+/CONTRIBUTING.md        @anilbeyazoglu @Docyrus/system
+/CODE_OF_CONDUCT.md     @anilbeyazoglu @Docyrus/system
+/.github/               @anilbeyazoglu @Docyrus/system
+/.ruler/                @anilbeyazoglu @Docyrus/system

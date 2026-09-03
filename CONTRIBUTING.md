@@ -90,6 +90,8 @@ points that bite newcomers:
 - Fill in the PR template: what changed, why, and how you verified it on a real
   window — this app's behaviour is hard to judge from a diff alone.
 - CI must be green and one `CODEOWNERS` review is required before merge.
+  Every pull request requests a review from @anilbeyazoglu plus the owning
+  team, so tag them if a review is sitting idle.
 - Bump the version in **both** `package.json` and `app.json` when releasing;
   don't bump it in ordinary PRs.
 
