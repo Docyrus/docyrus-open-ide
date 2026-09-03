@@ -22,7 +22,8 @@ the `system` team.
 
 You do **not** need to install Zig yourself. The Native SDK fetches its pinned
 Zig 0.16 toolchain into `~/.native/toolchains/` on the first build, and the npm
-scripts put that directory on `PATH`.
+scripts put that directory on `PATH`. It asks before downloading the first time;
+answer yes, or pass the flag through npm as `npm run dev -- --yes`.
 
 ## Setup
 

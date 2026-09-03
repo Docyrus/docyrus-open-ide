@@ -27,7 +27,7 @@ The installer places `Docyrus Open IDE.app` in `/Applications`, clears the downl
 
 ## Develop
 
-You need macOS on Apple Silicon, Node.js 24 or newer, and the Xcode Command Line Tools. You do not need to install Zig: the Native SDK fetches its pinned Zig 0.16 toolchain into `~/.native/toolchains/` on the first build, and the npm scripts put it on `PATH`.
+You need macOS on Apple Silicon, Node.js 24 or newer, and the Xcode Command Line Tools. You do not need to install Zig: the Native SDK fetches its pinned Zig 0.16 toolchain into `~/.native/toolchains/` on the first build (it asks before downloading), and the npm scripts put it on `PATH`.
 
 ```sh
 npm install

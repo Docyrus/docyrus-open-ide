@@ -55,8 +55,11 @@ jobs:
       - name: Check
         run: npm run check
 
+      # `native` asks before downloading its pinned Zig toolchain, and CI has no
+      # tty to answer, so pass --yes. The first zig-needing step fetches it; the
+      # cache above keeps later runs from re-downloading.
       - name: Test
-        run: npm test
+        run: npm test -- --yes
 
       - name: Build
-        run: npm run build
+        run: npm run build -- --yes
