@@ -3312,22 +3312,24 @@ fn resolvePreferencesPath(init: std.process.Init, output: []u8) ?[]const u8 {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var initial_model: Model = .{};
+    // The Model is several megabytes of fixed-size buffers. Build it in
+    // place on the heap: every stack copy of it counts against the 8 MiB
+    // main-thread stack WebKit assumes, and exceeding that traps inside
+    // JavaScriptCore as soon as a WebView posts its first bridge message.
+    const app_state = try DocyrusApp.create(std.heap.page_allocator, appOptions(init.io));
+    defer app_state.destroy();
+    const initial_model = &app_state.model;
+
     if (init.environ_map.get("HOME")) |home_path| initial_model.setHomePath(home_path);
     var preferences_path: [1024]u8 = undefined;
     const resolved_preferences = resolvePreferencesPath(init, &preferences_path);
-    if (resolved_preferences) |path| loadPreferences(&initial_model, init.io, path);
+    if (resolved_preferences) |path| loadPreferences(initial_model, init.io, path);
     if (init.environ_map.get("DOCYRUS_OPEN_IDE_E2E_PROJECT")) |path| {
-        initial_model.active_project_id = addProject(&initial_model, path) orelse 0;
+        initial_model.active_project_id = addProject(initial_model, path) orelse 0;
     }
-    if (init.environ_map.get("DOCYRUS_OPEN_IDE_E2E_RECENT")) |path| addRecentProject(&initial_model, path);
+    if (init.environ_map.get("DOCYRUS_OPEN_IDE_E2E_RECENT")) |path| addRecentProject(initial_model, path);
     initial_model.add_project_open = initial_model.project_count == 0;
-    syncUrls(&initial_model);
-
-    const app_state = try std.heap.page_allocator.create(DocyrusApp);
-    defer std.heap.page_allocator.destroy(app_state);
-    app_state.* = DocyrusApp.init(std.heap.page_allocator, initial_model, appOptions(init.io));
-    defer app_state.deinit();
+    syncUrls(initial_model);
 
     var base = app_state.app();
     base.source = native_sdk.WebViewSource.assets(.{
