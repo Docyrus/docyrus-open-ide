@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Docyrus/docyrus-open-ide/security/advisories/new
+    about: Report privately. Do not open a public issue for a security problem.
+  - name: Contributing guide
+    url: https://github.com/Docyrus/docyrus-open-ide/blob/main/CONTRIBUTING.md
+    about: Setup, build prerequisites, and the pull request process.

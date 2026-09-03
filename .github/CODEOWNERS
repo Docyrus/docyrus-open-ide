@@ -1,0 +1,22 @@
+# Every pull request needs a review from the owning team.
+# Ownership is by area; the last matching pattern wins.
+
+*                       @Docyrus/system
+
+# Native core, UI markup, and app manifest
+/src/                   @Docyrus/system
+/app.json               @Docyrus/system
+/build.zig              @Docyrus/system
+/build.zig.zon          @Docyrus/system
+
+# WebView frontends: Monaco editor and the file-explorer tree
+/frontend/              @Docyrus/frontend @Docyrus/system
+
+# Repo policy, licensing, CI, and agent instructions
+/LICENSE                @Docyrus/system
+/NOTICE                 @Docyrus/system
+/SECURITY.md            @Docyrus/system
+/CONTRIBUTING.md        @Docyrus/system
+/CODE_OF_CONDUCT.md     @Docyrus/system
+/.github/               @Docyrus/system
+/.ruler/                @Docyrus/system

@@ -679,6 +679,246 @@
     return { resolveIcon };
   }
 
+  // node_modules/@pierre/theming/dist/modules/color.js
+  var HEX_TRANSPARENT_RE = /^#(?:[0-9a-f]{3}0|[0-9a-f]{6}00)$/i;
+  var ALPHA_ZERO_RE = /^0(?:\.0+)?%?$/;
+  function getFunctionalAlpha(color) {
+    const openParen = color.indexOf("(");
+    if (openParen <= 0 || !color.endsWith(")")) return;
+    const fn = color.slice(0, openParen).trim();
+    if (!/^(?:rgb|rgba|hsl|hsla|hwb|lab|lch|oklab|oklch|color)$/i.test(fn)) return;
+    const inner = color.slice(openParen + 1, -1).trim();
+    if (inner.length === 0) return;
+    const slashIndex = inner.lastIndexOf("/");
+    if (slashIndex !== -1) return inner.slice(slashIndex + 1).trim();
+    if (/^(?:rgba|hsla)$/i.test(fn)) {
+      const parts = inner.split(",");
+      if (parts.length === 4) return parts[3]?.trim();
+    }
+  }
+  function parseHexRgba(color) {
+    const match = /^#([0-9a-f]{3}|[0-9a-f]{6}|[0-9a-f]{8})\b/i.exec(color.trim());
+    if (match == null) return null;
+    const hex = match[1];
+    let expanded;
+    let alpha = 1;
+    if (hex.length === 3) expanded = hex.split("").map((c3) => c3 + c3).join("");
+    else if (hex.length === 6) expanded = hex;
+    else {
+      expanded = hex.slice(0, 6);
+      alpha = parseInt(hex.slice(6, 8), 16) / 255;
+    }
+    return [
+      parseInt(expanded.slice(0, 2), 16),
+      parseInt(expanded.slice(2, 4), 16),
+      parseInt(expanded.slice(4, 6), 16),
+      alpha
+    ];
+  }
+  function relativeLuminance(color) {
+    if (color == null) return null;
+    const rgba = parseHexRgba(color);
+    if (rgba == null) return null;
+    const r3 = rgba[0] / 255;
+    const g3 = rgba[1] / 255;
+    const b2 = rgba[2] / 255;
+    const channel = (v3) => v3 <= 0.03928 ? v3 / 12.92 : ((v3 + 0.055) / 1.055) ** 2.4;
+    return 0.2126 * channel(r3) + 0.7152 * channel(g3) + 0.0722 * channel(b2);
+  }
+  function contrastRatio(a3, b2) {
+    const [hi, lo] = a3 > b2 ? [a3, b2] : [b2, a3];
+    return (hi + 0.05) / (lo + 0.05);
+  }
+  function compositeOverBg(fgColor, bgColor) {
+    if (bgColor == null) return void 0;
+    const fgParts = parseHexRgba(fgColor);
+    const bgParts = parseHexRgba(bgColor);
+    if (fgParts == null || bgParts == null) return void 0;
+    const [fr, fg, fb, fa] = fgParts;
+    const [br, bg, bb] = bgParts;
+    return "#" + [
+      Math.round(fr * fa + br * (1 - fa)),
+      Math.round(fg * fa + bg * (1 - fa)),
+      Math.round(fb * fa + bb * (1 - fa))
+    ].map((v3) => v3.toString(16).padStart(2, "0")).join("");
+  }
+  function isFullyTransparent(color) {
+    if (color == null) return false;
+    const normalized = color.trim().toLowerCase();
+    if (normalized === "transparent") return true;
+    if (HEX_TRANSPARENT_RE.test(normalized)) return true;
+    const alpha = getFunctionalAlpha(normalized);
+    return alpha != null && ALPHA_ZERO_RE.test(alpha);
+  }
+  function isDarkSurface(bg, fgHint) {
+    const fromBg = relativeLuminance(bg);
+    if (fromBg != null) return fromBg < 0.4;
+    const fromFg = relativeLuminance(fgHint);
+    return fromFg != null ? fromFg > 0.6 : false;
+  }
+  function surfacesMatch(a3, b2) {
+    if (a3 == null || b2 == null) return false;
+    if (a3.trim().toLowerCase() === b2.trim().toLowerCase()) return true;
+    const la = relativeLuminance(a3);
+    const lb = relativeLuminance(b2);
+    if (la == null || lb == null) return false;
+    return Math.abs(la - lb) < 0.06;
+  }
+  function hoverWouldEraseText(hover, bg, fg) {
+    if (bg == null || fg == null) return false;
+    const hoverL = relativeLuminance(hover);
+    const bgL = relativeLuminance(bg);
+    const fgL = relativeLuminance(fg);
+    if (hoverL == null || bgL == null || fgL == null) return false;
+    return Math.abs(hoverL - fgL) < Math.abs(hoverL - bgL);
+  }
+  function pickReadableForeground(bg, candidates) {
+    const bgL = relativeLuminance(bg);
+    const firstDefined = candidates.find((candidate) => candidate != null && candidate !== "");
+    if (bgL == null) return firstDefined;
+    let best;
+    let bestRatio = -1;
+    for (const candidate of candidates) {
+      if (candidate == null || candidate === "") continue;
+      const candidateL = relativeLuminance(candidate);
+      if (candidateL == null) continue;
+      const ratio = contrastRatio(bgL, candidateL);
+      if (ratio >= 3) return candidate;
+      if (ratio > bestRatio) {
+        best = candidate;
+        bestRatio = ratio;
+      }
+    }
+    return best ?? firstDefined;
+  }
+  function deriveMutedFg(primaryFg, bg) {
+    if (bg == null) return primaryFg;
+    const fgParts = parseHexRgba(primaryFg);
+    const bgParts = parseHexRgba(bg);
+    const bgL = relativeLuminance(bg);
+    if (fgParts == null || bgParts == null || bgL == null) return `color-mix(in srgb, ${primaryFg} 70%, ${bg})`;
+    const [fr, fg2, fb] = fgParts;
+    const [br, bg3, bb] = bgParts;
+    for (const weight of [
+      0.6,
+      0.7,
+      0.8,
+      0.9
+    ]) {
+      const hex = "#" + [
+        Math.round(fr * weight + br * (1 - weight)),
+        Math.round(fg2 * weight + bg3 * (1 - weight)),
+        Math.round(fb * weight + bb * (1 - weight))
+      ].map((v3) => v3.toString(16).padStart(2, "0")).join("");
+      const L2 = relativeLuminance(hex);
+      if (L2 != null && contrastRatio(bgL, L2) >= 4.5) return hex;
+    }
+    return primaryFg;
+  }
+
+  // node_modules/@pierre/theming/dist/modules/normalizeThemeColors.js
+  var cache = /* @__PURE__ */ new WeakMap();
+  function normalizeThemeColors(theme) {
+    const cached = cache.get(theme);
+    if (cached != null) return cached;
+    const originalColors = theme.colors ?? {};
+    const colors = { ...originalColors };
+    const editorBackground = originalColors["editor.background"] ?? theme.bg;
+    const editorForeground = originalColors["editor.foreground"] ?? theme.fg;
+    const sidebarBackground = originalColors["sideBar.background"] ?? editorBackground;
+    const sidebarForeground = originalColors["sideBar.foreground"] ?? editorForeground;
+    fill(colors, "editor.background", editorBackground);
+    fill(colors, "editor.foreground", editorForeground);
+    fill(colors, "sideBar.background", sidebarBackground);
+    fill(colors, "sideBar.foreground", sidebarForeground);
+    fill(colors, "input.background", originalColors["input.background"] ?? sidebarBackground);
+    fill(colors, "sideBarSectionHeader.foreground", originalColors["sideBarSectionHeader.foreground"] ?? sidebarForeground);
+    fill(colors, "list.activeSelectionForeground", originalColors["list.activeSelectionForeground"] ?? sidebarForeground);
+    fill(colors, "gitDecoration.addedResourceForeground", firstColor(originalColors["gitDecoration.addedResourceForeground"], originalColors["terminal.ansiGreen"], originalColors["editorGutter.addedBackground"]));
+    fill(colors, "gitDecoration.modifiedResourceForeground", firstColor(originalColors["gitDecoration.modifiedResourceForeground"], originalColors["terminal.ansiBlue"], originalColors["editorGutter.modifiedBackground"]));
+    fill(colors, "gitDecoration.deletedResourceForeground", firstColor(originalColors["gitDecoration.deletedResourceForeground"], originalColors["terminal.ansiRed"], originalColors["editorGutter.deletedBackground"]));
+    const focusRing = (isFullyTransparent(originalColors["list.focusOutline"]) ? void 0 : originalColors["list.focusOutline"]) ?? (isFullyTransparent(originalColors["focusBorder"]) ? void 0 : originalColors["focusBorder"]);
+    if (focusRing != null) colors["list.focusOutline"] = focusRing;
+    else delete colors["list.focusOutline"];
+    const hover = originalColors["list.hoverBackground"];
+    if (hover != null && (matchesSurface(hover, sidebarBackground) || hoverWouldEraseText(hover, sidebarBackground, sidebarForeground))) delete colors["list.hoverBackground"];
+    const result = Object.freeze({
+      ...theme,
+      colors: Object.freeze(colors)
+    });
+    cache.set(theme, result);
+    return result;
+  }
+  function fill(colors, key, value) {
+    if (value != null && value !== "") colors[key] = value;
+  }
+  function firstColor(...candidates) {
+    for (const candidate of candidates) if (candidate != null && candidate !== "") return candidate;
+  }
+  function matchesSurface(color, surface) {
+    return surface != null && color.toLowerCase() === surface.toLowerCase();
+  }
+
+  // node_modules/@pierre/theming/dist/color.js
+  var colorUtils = {
+    compositeOverBg,
+    contrastRatio,
+    deriveMutedFg,
+    hoverWouldEraseText,
+    isDarkSurface,
+    isFullyTransparent,
+    pickReadableForeground,
+    relativeLuminance,
+    surfacesMatch
+  };
+
+  // node_modules/@pierre/trees/dist/utils/themeToTreeStyles.js
+  function themeToTreeStyles(theme) {
+    const colors = normalizeThemeColors(theme).colors ?? {};
+    const isDark = theme.type === "dark";
+    const sidebarBg = colors["sideBar.background"];
+    const sidebarFg = colors["sideBar.foreground"];
+    const sectionHeaderFg = colors["sideBarSectionHeader.foreground"];
+    const selectionFg = colors["list.activeSelectionForeground"];
+    const hoverBg = colors["list.hoverBackground"];
+    const focusRing = colors["list.focusOutline"];
+    const inputBg = colors["input.background"];
+    const sidebarBorder = colors["sideBar.border"];
+    const inputBorder = colors["input.border"];
+    const scrollbarThumb = colors["scrollbarSlider.background"];
+    const addedFg = colors["gitDecoration.addedResourceForeground"];
+    const modifiedFg = colors["gitDecoration.modifiedResourceForeground"];
+    const deletedFg = colors["gitDecoration.deletedResourceForeground"];
+    const sidebarL = colorUtils.relativeLuminance(sidebarBg);
+    const sideBarIsDark = sidebarL != null ? sidebarL < 0.5 : isDark;
+    const rawSelectionBg = colors["list.activeSelectionBackground"];
+    const focusBackground = colors["list.focusBackground"];
+    const editorSelectionBg = colors["editor.selectionBackground"];
+    const sidebarBgLower = sidebarBg?.toLowerCase();
+    const selectionBg = rawSelectionBg != null && rawSelectionBg.toLowerCase() === sidebarBgLower ? focusBackground ?? editorSelectionBg : rawSelectionBg ?? editorSelectionBg;
+    const result = {
+      colorScheme: isDark ? "dark" : "light",
+      backgroundColor: sidebarBg ?? "",
+      color: sidebarFg ?? "",
+      borderColor: "var(--trees-theme-sidebar-border, light-dark(oklch(0% 0 0 / 0.15), oklch(100% 0 0 / 0.15)))",
+      "--trees-theme-sidebar-bg": sidebarBg ?? "",
+      "--trees-theme-sidebar-fg": sidebarFg ?? "",
+      "--trees-theme-sidebar-header-fg": sectionHeaderFg ?? "",
+      "--trees-theme-list-active-selection-fg": selectionFg ?? "",
+      "--trees-theme-list-hover-bg": hoverBg ?? (sideBarIsDark ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.06)"),
+      "--trees-theme-list-active-selection-bg": selectionBg ?? "transparent",
+      "--trees-theme-focus-ring": focusRing ?? sidebarFg ?? "",
+      "--trees-theme-input-bg": inputBg ?? ""
+    };
+    if (sidebarBorder != null && sidebarBorder !== "") result["--trees-theme-sidebar-border"] = sidebarBorder;
+    if (inputBorder != null && inputBorder !== "") result["--trees-theme-input-border"] = inputBorder;
+    if (scrollbarThumb != null && scrollbarThumb !== "") result["--trees-theme-scrollbar-thumb"] = scrollbarThumb;
+    if (addedFg != null && addedFg !== "") result["--trees-theme-git-added-fg"] = addedFg;
+    if (modifiedFg != null && modifiedFg !== "") result["--trees-theme-git-modified-fg"] = modifiedFg;
+    if (deletedFg != null && deletedFg !== "") result["--trees-theme-git-deleted-fg"] = deletedFg;
+    return result;
+  }
+
   // node_modules/@pierre/trees/dist/path-store/src/child-index.js
   var PATH_STORE_CHILD_INDEX_CHUNK_SHIFT = 5;
   var PATH_STORE_CHILD_INDEX_CHUNK_SIZE = 1 << PATH_STORE_CHILD_INDEX_CHUNK_SHIFT;
@@ -979,12 +1219,12 @@
   function comparePreparedPaths(left, right) {
     return comparePreparedEntries(left, right);
   }
-  function comparePreparedPathsWithCachedSortKeys(left, right, cache) {
+  function comparePreparedPathsWithCachedSortKeys(left, right, cache2) {
     const getCachedSortKey = (value) => {
-      const existingKey = cache.get(value);
+      const existingKey = cache2.get(value);
       if (existingKey != null) return existingKey;
       const nextKey = createSegmentSortKey(value);
-      cache.set(value, nextKey);
+      cache2.set(value, nextKey);
       return nextKey;
     };
     const sharedDepth = Math.min(left.segments.length, right.segments.length);
@@ -9161,9 +9401,54 @@
   var status = document.querySelector("#tree-status");
   var tree;
   var lastOpenedPath = "";
+  var themes = {
+    light: {
+      type: "light",
+      colors: {
+        "sideBar.background": "#f7f7f8",
+        "sideBar.foreground": "#202124",
+        "sideBarSectionHeader.foreground": "#6d6f73",
+        "sideBar.border": "rgba(0, 0, 0, 0.1)",
+        "list.hoverBackground": "rgba(0, 122, 255, 0.08)",
+        "list.activeSelectionBackground": "rgba(0, 122, 255, 0.14)",
+        "list.activeSelectionForeground": "#202124",
+        "list.focusOutline": "#007aff",
+        "input.background": "#ffffff",
+        "input.border": "rgba(0, 0, 0, 0.16)",
+        "scrollbarSlider.background": "rgba(0, 0, 0, 0.22)"
+      }
+    },
+    dark: {
+      type: "dark",
+      colors: {
+        "sideBar.background": "#18191b",
+        "sideBar.foreground": "#f1f1f2",
+        "sideBarSectionHeader.foreground": "#a8aaae",
+        "sideBar.border": "rgba(255, 255, 255, 0.11)",
+        "list.hoverBackground": "rgba(255, 255, 255, 0.08)",
+        "list.activeSelectionBackground": "rgba(10, 132, 255, 0.28)",
+        "list.activeSelectionForeground": "#ffffff",
+        "list.focusOutline": "#0a84ff",
+        "input.background": "#111214",
+        "input.border": "rgba(255, 255, 255, 0.16)",
+        "scrollbarSlider.background": "rgba(255, 255, 255, 0.24)"
+      }
+    }
+  };
+  function resolvedThemeName() {
+    return requestedTheme === "system" ? systemDark.matches ? "dark" : "light" : requestedTheme;
+  }
+  function setElementStyles(element, styles) {
+    if (!element) return;
+    for (const [property, value] of Object.entries(styles)) {
+      if (property.startsWith("--")) element.style.setProperty(property, value);
+      else element.style[property] = value;
+    }
+  }
   function applyTheme() {
-    const theme = requestedTheme === "system" ? systemDark.matches ? "dark" : "light" : requestedTheme;
-    document.documentElement.dataset.theme = theme;
+    const themeName = resolvedThemeName();
+    document.documentElement.dataset.theme = themeName;
+    setElementStyles(tree?.getFileTreeContainer(), themeToTreeStyles(themes[themeName]));
   }
   async function invoke(command, payload) {
     if (!window.zero?.invoke) throw new Error("Native bridge is unavailable");
@@ -9212,7 +9497,7 @@
         id: `workspace-files-${projectId}`,
         paths: Array.isArray(paths) ? paths : [],
         flattenEmptyDirectories: false,
-        initialExpansion: "open",
+        initialExpansion: "closed",
         search: true,
         density: "compact",
         onSelectionChange(selectedPaths) {
@@ -9221,6 +9506,7 @@
         }
       });
       tree.render({ containerWrapper: mount });
+      applyTheme();
       const notes = [];
       if (truncated) notes.push("showing first 1,200");
       if (skipped > 0) notes.push(`${skipped} inaccessible skipped`);

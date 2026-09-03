@@ -4,13 +4,16 @@
   "private": true,
   "description": "A lightweight Native SDK editor with Monaco, Markdown preview, and terminal panes.",
   "scripts": {
+    "patch:native-sdk": "node scripts/patch-native-sdk-pointer.mjs",
+    "postinstall": "npm run patch:native-sdk",
     "bundle:tree": "esbuild frontend/tree.js --bundle --format=iife --platform=browser --target=safari16 --outfile=frontend/dist/tree.js",
-    "precheck": "npm run bundle:tree",
+    "precheck": "npm run patch:native-sdk && npm run bundle:tree",
     "check": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" native check",
-    "predev": "npm run bundle:tree",
+    "predev": "npm run patch:native-sdk && npm run bundle:tree",
     "dev": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" native dev",
-    "prebuild": "npm run bundle:tree",
+    "prebuild": "npm run patch:native-sdk && npm run bundle:tree",
     "build": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" native build",
+    "pretest": "npm run patch:native-sdk",
     "test": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" native test"
   },
   "dependencies": {

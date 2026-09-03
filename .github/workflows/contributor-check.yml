@@ -1,0 +1,49 @@
+name: Contributor check
+
+# While the project is org-members-only, flag pull requests from outside the
+# Docyrus organization so reviewers see it immediately. This does not block
+# anything on its own — branch protection and CODEOWNERS gate the merge.
+#
+# Runs on pull_request_target and deliberately does NOT check out PR code, so
+# an untrusted fork cannot run anything with this job's write token.
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  membership:
+    name: check author membership
+    runs-on: ubuntu-latest
+    steps:
+      - name: Flag non-member pull requests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "Author $AUTHOR has association: $ASSOCIATION"
+          case "$ASSOCIATION" in
+            OWNER|MEMBER|COLLABORATOR)
+              echo "Author is part of the Docyrus organization or a repo collaborator."
+              ;;
+            *)
+              echo "::warning::Pull request author $AUTHOR is not a Docyrus organization member."
+              gh pr edit "$PR" --repo "$REPO" --add-label "external-contributor"
+              gh pr comment "$PR" --repo "$REPO" --body-file - <<'BODY'
+          Thanks for the pull request!
+
+          Docyrus Open IDE is public to read and install, but while the project settles we
+          merge changes only from members of the [Docyrus organization](https://github.com/Docyrus).
+          A maintainer will take a look and let you know whether we can accept this patch,
+          or suggest opening an issue to discuss it first.
+
+          See [CONTRIBUTING.md](https://github.com/Docyrus/docyrus-open-ide/blob/main/CONTRIBUTING.md) for the current policy.
+          BODY
+              ;;
+          esac

@@ -46,14 +46,17 @@ pub const TabView = struct {
     title: []const u8,
     icon: []const u8,
     selected: bool,
+    dirty: bool,
 };
 
 pub const ProjectView = struct {
     id: u32,
     path: []const u8,
+    display_path: []const u8,
     name: []const u8,
-    initials: []const u8,
     selected: bool,
+    actions_open: bool,
+    show_actions: bool,
 };
 
 pub const RecentProjectView = struct {
@@ -71,6 +74,8 @@ pub const TabDragMessage = struct {
     viewHeight: f32 = 0,
 };
 
+pub const ProjectDragMessage = TabDragMessage;
+
 const OpenFileMessage = struct {
     project_id: u32,
     path: []const u8,
@@ -81,11 +86,24 @@ const MarkdownSavedMessage = struct {
     project_id: u32,
     slot: u32,
     content: []const u8,
+    close_after_save: bool = false,
 };
+
+const EditorDirtyMessage = struct {
+    project_id: u32,
+    slot: u32,
+    dirty: bool,
+};
+
+const CloseIntent = enum(u8) { none, single, others, all };
+const EditorAction = enum(u8) { none, save_and_close, discard_and_close };
 
 const FileTab = struct {
     used: bool = false,
+    dirty: bool = false,
     kind: FileKind = .text,
+    markdown_editor_visible: bool = true,
+    markdown_preview_visible: bool = true,
     path_buffer: [relative_path_capacity]u8 = undefined,
     path_len: usize = 0,
     title_buffer: [title_capacity]u8 = undefined,
@@ -147,6 +165,8 @@ const LayoutState = struct {
 const ProjectState = struct {
     path_buffer: [project_path_capacity]u8 = undefined,
     path_len: usize = 0,
+    name_buffer: [title_capacity]u8 = undefined,
+    name_len: usize = 0,
     layout: LayoutState = .{},
 
     fn path(self: *const ProjectState) []const u8 {
@@ -157,11 +177,22 @@ const ProjectState = struct {
         self.path_len = @min(value.len, self.path_buffer.len);
         @memcpy(self.path_buffer[0..self.path_len], value[0..self.path_len]);
     }
+
+    fn displayName(self: *const ProjectState) []const u8 {
+        return if (self.name_len > 0) self.name_buffer[0..self.name_len] else projectName(self.path());
+    }
+
+    fn setDisplayName(self: *ProjectState, value: []const u8) void {
+        self.name_len = @min(value.len, self.name_buffer.len);
+        @memcpy(self.name_buffer[0..self.name_len], value[0..self.name_len]);
+    }
 };
 
 const RecentProject = struct {
     path_buffer: [project_path_capacity]u8 = undefined,
     path_len: usize = 0,
+    name_buffer: [title_capacity]u8 = undefined,
+    name_len: usize = 0,
 
     fn path(self: *const RecentProject) []const u8 {
         return self.path_buffer[0..self.path_len];
@@ -171,6 +202,15 @@ const RecentProject = struct {
         self.path_len = @min(value.len, self.path_buffer.len);
         @memcpy(self.path_buffer[0..self.path_len], value[0..self.path_len]);
     }
+
+    fn displayName(self: *const RecentProject) []const u8 {
+        return if (self.name_len > 0) self.name_buffer[0..self.name_len] else projectName(self.path());
+    }
+
+    fn setDisplayName(self: *RecentProject, value: []const u8) void {
+        self.name_len = @min(value.len, self.name_buffer.len);
+        @memcpy(self.name_buffer[0..self.name_len], value[0..self.name_len]);
+    }
 };
 
 pub const Model = struct {
@@ -178,12 +218,27 @@ pub const Model = struct {
         "projects",
         "project_count",
         "active_project_id",
+        "project_order",
         "recent_projects",
         "recent_count",
         "theme_mode",
+        "home_path_buffer",
+        "home_path_len",
+        "pending_close_project_id",
+        "pending_close_tab_id",
+        "pending_close_source_id",
+        "pending_close_pane",
+        "pending_close_intent",
+        "pending_editor_action",
         "project_switching",
         "directory_picker_requested",
         "drag_active",
+        "project_drag_active",
+        "project_menu_open",
+        "project_menu_id",
+        "hovered_project_id",
+        "rename_project_id",
+        "rename_project_buffer",
         "primary_reload_token",
         "secondary_reload_token",
         "tree_reload_token",
@@ -205,16 +260,34 @@ pub const Model = struct {
     };
 
     projects: [max_projects]ProjectState = [_]ProjectState{.{}} ** max_projects,
+    project_order: [max_projects]u8 = [_]u8{0} ** max_projects,
     project_count: u8 = 0,
     active_project_id: u32 = 0,
     recent_projects: [max_recent_projects]RecentProject = [_]RecentProject{.{}} ** max_recent_projects,
     recent_count: u8 = 0,
     theme_mode: ThemeMode = .system,
+    project_sidebar_fraction: f32 = 200.0 / window_width,
+    home_path_buffer: [project_path_capacity]u8 = undefined,
+    home_path_len: usize = 0,
     add_project_open: bool = false,
     settings_open: bool = false,
+    project_menu_open: bool = false,
+    project_menu_id: u32 = 0,
+    hovered_project_id: u32 = 0,
+    rename_project_open: bool = false,
+    rename_project_id: u32 = 0,
+    rename_project_buffer: canvas.TextBuffer(title_capacity) = .{},
+    close_confirmation_open: bool = false,
+    pending_close_project_id: u32 = 0,
+    pending_close_tab_id: u8 = 0,
+    pending_close_source_id: u8 = 0,
+    pending_close_pane: Pane = .primary,
+    pending_close_intent: CloseIntent = .none,
+    pending_editor_action: EditorAction = .none,
     project_switching: bool = false,
     directory_picker_requested: bool = false,
     drag_active: bool = false,
+    project_drag_active: bool = false,
     primary_reload_token: u64 = 0,
     secondary_reload_token: u64 = 0,
     tree_reload_token: u64 = 0,
@@ -231,6 +304,15 @@ pub const Model = struct {
     preview_image_path: [2048]u8 = undefined,
     preview_image_path_len: usize = 0,
     clipboard_key: u64 = clipboard_effect_key_start,
+
+    fn homePath(model: *const Model) []const u8 {
+        return model.home_path_buffer[0..model.home_path_len];
+    }
+
+    fn setHomePath(model: *Model, value: []const u8) void {
+        model.home_path_len = @min(value.len, model.home_path_buffer.len);
+        @memcpy(model.home_path_buffer[0..model.home_path_len], value[0..model.home_path_len]);
+    }
 
     fn activeProject(model: *Model) ?*ProjectState {
         if (model.active_project_id == 0 or model.active_project_id > model.project_count) return null;
@@ -255,13 +337,16 @@ pub const Model = struct {
     pub fn openProjects(model: *const Model, arena: std.mem.Allocator) []const ProjectView {
         const count: usize = model.project_count;
         const views = arena.alloc(ProjectView, count) catch return &.{};
-        for (model.projects[0..count], 0..) |*project, index| {
+        for (model.project_order[0..count], 0..) |project_id, index| {
+            const project = &model.projects[project_id - 1];
             views[index] = .{
-                .id = @intCast(index + 1),
+                .id = project_id,
                 .path = project.path(),
-                .name = projectName(project.path()),
-                .initials = projectInitials(project.path(), arena),
-                .selected = model.active_project_id == @as(u32, @intCast(index + 1)),
+                .display_path = displayProjectPath(project.path(), model.homePath(), arena),
+                .name = project.displayName(),
+                .selected = model.active_project_id == project_id,
+                .actions_open = model.project_menu_open and model.project_menu_id == project_id,
+                .show_actions = model.hovered_project_id == project_id or (model.project_menu_open and model.project_menu_id == project_id),
             };
         }
         return views;
@@ -275,7 +360,7 @@ pub const Model = struct {
             views[count] = .{
                 .id = @intCast(index + 1),
                 .path = recent.path(),
-                .name = projectName(recent.path()),
+                .name = recent.displayName(),
             };
             count += 1;
         }
@@ -295,12 +380,24 @@ pub const Model = struct {
     }
 
     pub fn project_name(model: *const Model) []const u8 {
-        return projectName(model.workspace_path());
+        const project = model.activeProjectConst() orelse return "No project";
+        return project.displayName();
+    }
+
+    pub fn rename_project_text(model: *const Model) []const u8 {
+        return model.rename_project_buffer.text();
     }
 
     pub fn explorer_open(model: *const Model) bool {
         const layout = model.activeLayoutConst() orelse return false;
         return layout.explorer_open;
+    }
+
+    pub fn pending_close_title(model: *const Model) []const u8 {
+        const layout = model.activeLayoutConst() orelse return "File";
+        const id = model.pending_close_tab_id;
+        if (id < 1 or id > max_file_tabs) return "File";
+        return layout.file_tabs[id - 1].title();
     }
 
     pub fn explorer_fraction(model: *const Model) f32 {
@@ -356,6 +453,22 @@ pub const Model = struct {
 
     pub fn primary_is_markdown_active(model: *const Model) bool {
         return paneFileKind(model, .primary) == .markdown;
+    }
+
+    pub fn primary_markdown_editor_visible(model: *const Model) bool {
+        return paneMarkdownEditorVisible(model, .primary);
+    }
+
+    pub fn primary_markdown_preview_visible(model: *const Model) bool {
+        return paneMarkdownPreviewVisible(model, .primary);
+    }
+
+    pub fn secondary_markdown_editor_visible(model: *const Model) bool {
+        return paneMarkdownEditorVisible(model, .secondary);
+    }
+
+    pub fn secondary_markdown_preview_visible(model: *const Model) bool {
+        return paneMarkdownPreviewVisible(model, .secondary);
     }
 
     pub fn secondary_is_markdown_active(model: *const Model) bool {
@@ -472,6 +585,10 @@ pub const Msg = union(enum) {
         "directory_picker_cancelled",
         "open_file",
         "markdown_saved",
+        "editor_dirty_changed",
+        "editor_discarded",
+        "toggle_markdown_editor",
+        "toggle_markdown_preview",
         "finish_project_switch",
     };
 
@@ -480,15 +597,20 @@ pub const Msg = union(enum) {
     image_loaded: native_sdk.EffectImageResult,
     term_one_state: canvas.TerminalState,
     term_two_state: canvas.TerminalState,
+    project_sidebar_resized: f32,
     explorer_resized: f32,
     split_resized: f32,
     markdown_resized: f32,
     toggle_explorer,
     activate_tab: u32,
     drag_tab: TabDragMessage,
+    drag_project: ProjectDragMessage,
     close_tab: u32,
     close_other_tabs: u32,
     close_all_tabs: u32,
+    save_and_close_tab,
+    discard_and_close_tab,
+    cancel_close_tab,
     copy_path: u32,
     copy_relative_path: u32,
     reveal_in_finder: u32,
@@ -496,6 +618,16 @@ pub const Msg = union(enum) {
     split_horizontal,
     split_vertical,
     select_project: u32,
+    hover_project: u32,
+    leave_project: u32,
+    toggle_project_menu: u32,
+    close_project_menu,
+    close_project: u32,
+    remove_project: u32,
+    begin_rename_project: u32,
+    rename_project_input: canvas.TextInputEvent,
+    confirm_rename_project,
+    cancel_rename_project,
     open_add_project,
     close_add_project,
     choose_project_directory,
@@ -507,13 +639,24 @@ pub const Msg = union(enum) {
     set_theme_system,
     set_theme_light,
     set_theme_dark,
+    toggle_primary_markdown_editor,
+    toggle_primary_markdown_preview,
+    toggle_secondary_markdown_editor,
+    toggle_secondary_markdown_preview,
+    toggle_markdown_editor: u32,
+    toggle_markdown_preview: u32,
     open_file: OpenFileMessage,
     markdown_saved: MarkdownSavedMessage,
+    editor_dirty_changed: EditorDirtyMessage,
+    editor_discarded,
     refresh_files,
     finish_project_switch,
 };
 
-const DocyrusApp = native_sdk.UiAppWithFeatures(Model, Msg, .{ .runtime_markup = builtin.mode == .Debug });
+// The SDK's runtime markup interpreter currently crashes while rebuilding this
+// template-heavy layout after the first pane is created. Compiled markup uses
+// the same declarative source and is stable in both Debug and Release builds.
+const DocyrusApp = native_sdk.UiAppWithFeatures(Model, Msg, .{ .runtime_markup = false });
 pub const Effects = DocyrusApp.Effects;
 
 pub fn boot(_: *Model, _: *Effects) void {}
@@ -523,10 +666,12 @@ fn projectName(path: []const u8) []const u8 {
     return std.fs.path.basename(path);
 }
 
-fn projectInitials(path: []const u8, arena: std.mem.Allocator) []const u8 {
-    const name = projectName(path);
-    const output = arena.alloc(u8, @min(@as(usize, 2), name.len)) catch return "PR";
-    for (output, 0..) |*byte, index| byte.* = std.ascii.toUpper(name[index]);
+fn displayProjectPath(path: []const u8, home: []const u8, arena: std.mem.Allocator) []const u8 {
+    if (home.len == 0 or !std.mem.startsWith(u8, path, home)) return path;
+    if (path.len != home.len and path[home.len] != '/') return path;
+    const output = arena.alloc(u8, 1 + path.len - home.len) catch return path;
+    output[0] = '~';
+    @memcpy(output[1..], path[home.len..]);
     return output;
 }
 
@@ -604,7 +749,23 @@ fn paneFileKind(model: *const Model, pane: Pane) ?FileKind {
 
 fn paneUsesEditor(model: *const Model, pane: Pane) bool {
     const kind = paneFileKind(model, pane) orelse return false;
-    return kind != .image;
+    if (kind == .image) return false;
+    if (kind == .markdown) return paneMarkdownEditorVisible(model, pane);
+    return true;
+}
+
+fn paneMarkdownEditorVisible(model: *const Model, pane: Pane) bool {
+    const layout = model.activeLayoutConst() orelse return false;
+    const slot = activeFileSlot(layout, pane) orelse return false;
+    const tab = &layout.file_tabs[slot];
+    return tab.kind == .markdown and tab.markdown_editor_visible;
+}
+
+fn paneMarkdownPreviewVisible(model: *const Model, pane: Pane) bool {
+    const layout = model.activeLayoutConst() orelse return false;
+    const slot = activeFileSlot(layout, pane) orelse return false;
+    const tab = &layout.file_tabs[slot];
+    return tab.kind == .markdown and tab.markdown_preview_visible;
 }
 
 fn paneMarkdown(model: *const Model, pane: Pane) []const u8 {
@@ -620,7 +781,14 @@ fn tabViews(model: *const Model, pane: Pane, arena: std.mem.Allocator) []const T
     const views = arena.alloc(TabView, order.len) catch return &.{};
     const active = paneActive(model, pane);
     for (order, 0..) |id, index| {
-        views[index] = .{ .id = id, .title = tabTitle(layout, id), .icon = tabIcon(layout, id), .selected = active == id };
+        const dirty = id <= max_file_tabs and layout.file_tabs[id - 1].dirty;
+        views[index] = .{
+            .id = id,
+            .title = tabTitle(layout, id),
+            .icon = tabIcon(layout, id),
+            .selected = active == id,
+            .dirty = dirty,
+        };
     }
     return views;
 }
@@ -653,7 +821,7 @@ fn normalizeProjectPath(path: []const u8) []const u8 {
     return path[0..end];
 }
 
-fn addRecentProject(model: *Model, raw_path: []const u8) void {
+fn addRecentProjectNamed(model: *Model, raw_path: []const u8, display_name: []const u8) void {
     const path = normalizeProjectPath(raw_path);
     if (path.len == 0) return;
     var existing: ?usize = null;
@@ -668,6 +836,18 @@ fn addRecentProject(model: *Model, raw_path: []const u8) void {
     var cursor = source_index;
     while (cursor > 0) : (cursor -= 1) model.recent_projects[cursor] = model.recent_projects[cursor - 1];
     model.recent_projects[0].setPath(path);
+    model.recent_projects[0].setDisplayName(display_name);
+}
+
+fn addRecentProject(model: *Model, raw_path: []const u8) void {
+    addRecentProjectNamed(model, raw_path, "");
+}
+
+fn recentDisplayName(model: *const Model, path: []const u8) []const u8 {
+    for (model.recent_projects[0..model.recent_count]) |*recent| {
+        if (std.mem.eql(u8, recent.path(), path)) return recent.name_buffer[0..recent.name_len];
+    }
+    return "";
 }
 
 fn addProject(model: *Model, raw_path: []const u8) ?u32 {
@@ -676,15 +856,18 @@ fn addProject(model: *Model, raw_path: []const u8) ?u32 {
     // ever resolving relative to the directory that launched the app.
     if (path.len == 0 or !std.fs.path.isAbsolute(path)) return null;
     if (model.findProject(path)) |index| {
-        addRecentProject(model, path);
+        const project = &model.projects[index];
+        addRecentProjectNamed(model, path, project.name_buffer[0..project.name_len]);
         return @intCast(index + 1);
     }
     if (model.project_count >= max_projects) return null;
     const index: usize = model.project_count;
     model.projects[index] = .{};
     model.projects[index].setPath(path);
+    model.projects[index].setDisplayName(recentDisplayName(model, path));
     model.project_count += 1;
-    addRecentProject(model, path);
+    model.project_order[index] = @intCast(index + 1);
+    addRecentProjectNamed(model, path, model.projects[index].name_buffer[0..model.projects[index].name_len]);
     return @intCast(index + 1);
 }
 
@@ -697,6 +880,129 @@ fn selectProject(model: *Model, project_id: u32) void {
     model.secondary_reload_token +%= 1;
     model.tree_reload_token +%= 1;
     syncUrls(model);
+}
+
+fn projectOrderPosition(model: *const Model, project_id: u32) ?usize {
+    for (model.project_order[0..model.project_count], 0..) |candidate, index| {
+        if (candidate == project_id) return index;
+    }
+    return null;
+}
+
+fn removeRecentProject(model: *Model, path: []const u8) void {
+    var found: ?usize = null;
+    for (model.recent_projects[0..model.recent_count], 0..) |*recent, index| {
+        if (std.mem.eql(u8, recent.path(), path)) {
+            found = index;
+            break;
+        }
+    }
+    const index = found orelse return;
+    var cursor = index;
+    while (cursor + 1 < model.recent_count) : (cursor += 1) model.recent_projects[cursor] = model.recent_projects[cursor + 1];
+    model.recent_count -= 1;
+    model.recent_projects[model.recent_count] = .{};
+}
+
+fn firstDirtyTab(project: *const ProjectState) ?u8 {
+    for (&project.layout.file_tabs, 0..) |*tab, index| {
+        if (tab.used and tab.dirty) return @intCast(index + 1);
+    }
+    return null;
+}
+
+fn closeProject(model: *Model, project_id: u32, forget: bool, fx: *Effects) void {
+    if (project_id == 0 or project_id > model.project_count) return;
+    const project_index: usize = @intCast(project_id - 1);
+    if (firstDirtyTab(&model.projects[project_index])) |dirty_tab| {
+        if (model.active_project_id != project_id) selectProject(model, project_id);
+        requestCloseTab(model, dirty_tab);
+        return;
+    }
+
+    var path_copy: [project_path_capacity]u8 = undefined;
+    const path = model.projects[project_index].path();
+    const path_len = @min(path.len, path_copy.len);
+    @memcpy(path_copy[0..path_len], path[0..path_len]);
+    var name_copy: [title_capacity]u8 = undefined;
+    const name = model.projects[project_index].name_buffer[0..model.projects[project_index].name_len];
+    const name_len = @min(name.len, name_copy.len);
+    @memcpy(name_copy[0..name_len], name[0..name_len]);
+
+    if (forget) removeRecentProject(model, path_copy[0..path_len]) else addRecentProjectNamed(model, path_copy[0..path_len], name_copy[0..name_len]);
+
+    // Project IDs are used as PTY keys. Stop every affected slot before the
+    // compacting shift so a terminal can never be routed to the wrong folder.
+    var affected_id = project_id;
+    while (affected_id <= model.project_count) : (affected_id += 1) {
+        const affected = &model.projects[affected_id - 1];
+        if (affected.layout.term_one_started) fx.ptyKill(terminalKey(affected_id, 0));
+        if (affected.layout.term_two_started) fx.ptyKill(terminalKey(affected_id, 1));
+        affected.layout.term_one_started = false;
+        affected.layout.term_two_started = false;
+        affected.layout.term_one_live = false;
+        affected.layout.term_two_live = false;
+    }
+
+    var cursor = project_index;
+    while (cursor + 1 < model.project_count) : (cursor += 1) model.projects[cursor] = model.projects[cursor + 1];
+    model.project_count -= 1;
+    model.projects[model.project_count] = .{};
+
+    const order_position = projectOrderPosition(model, project_id) orelse 0;
+    cursor = order_position;
+    while (cursor + 1 <= model.project_count) : (cursor += 1) model.project_order[cursor] = model.project_order[cursor + 1];
+    model.project_order[model.project_count] = 0;
+    for (model.project_order[0..model.project_count]) |*ordered_id| {
+        if (ordered_id.* > project_id) ordered_id.* -= 1;
+    }
+
+    const old_active = model.active_project_id;
+    if (model.project_count == 0) {
+        model.active_project_id = 0;
+    } else if (old_active == project_id) {
+        model.active_project_id = @min(project_id, model.project_count);
+    } else if (old_active > project_id) {
+        model.active_project_id -= 1;
+    }
+    model.project_menu_open = false;
+    model.project_menu_id = 0;
+    if (model.hovered_project_id == project_id) model.hovered_project_id = 0;
+    model.rename_project_open = false;
+    model.rename_project_id = 0;
+    model.project_switching = model.active_project_id != 0;
+    model.preview_image = 0;
+    model.primary_reload_token +%= 1;
+    model.secondary_reload_token +%= 1;
+    model.tree_reload_token +%= 1;
+    syncUrls(model);
+}
+
+fn handleProjectDrag(model: *Model, event: ProjectDragMessage) void {
+    switch (event.phase) {
+        0 => model.project_drag_active = projectOrderPosition(model, event.sourceId) != null,
+        1 => {
+            defer model.project_drag_active = false;
+            if (!model.project_drag_active or model.project_count < 2) return;
+            const source = projectOrderPosition(model, event.sourceId) orelse return;
+            const list_top: f32 = 49;
+            const row_extent: f32 = 60;
+            const raw = @floor((event.y - list_top) / row_extent);
+            const target: usize = @intFromFloat(std.math.clamp(raw, 0, @as(f32, @floatFromInt(model.project_count - 1))));
+            if (source == target) return;
+            const moved = model.project_order[source];
+            if (source < target) {
+                var cursor = source;
+                while (cursor < target) : (cursor += 1) model.project_order[cursor] = model.project_order[cursor + 1];
+            } else {
+                var cursor = source;
+                while (cursor > target) : (cursor -= 1) model.project_order[cursor] = model.project_order[cursor - 1];
+            }
+            model.project_order[target] = moved;
+        },
+        2 => model.project_drag_active = false,
+        else => {},
+    }
 }
 
 fn syncUrls(model: *Model) void {
@@ -795,7 +1101,7 @@ fn openFile(model: *Model, message: OpenFileMessage, fx: *Effects) void {
     activateTab(model, @intCast(slot + 1), fx);
 }
 
-fn closeTab(model: *Model, id: u32) void {
+fn closeTabNow(model: *Model, id: u32) void {
     const layout = model.activeLayout() orelse return;
     const pane = paneForTab(layout, id) orelse return;
     const index = tabIndex(layout, pane, id) orelse return;
@@ -808,7 +1114,7 @@ fn closeTab(model: *Model, id: u32) void {
     syncUrls(model);
 }
 
-fn closeOtherTabs(model: *Model, id: u32, fx: *Effects) void {
+fn closeOtherTabsNow(model: *Model, id: u32, fx: *Effects) void {
     const layout = model.activeLayout() orelse return;
     const pane = paneForTab(layout, id) orelse return;
     const old_order = paneOrder(layout, pane);
@@ -833,9 +1139,8 @@ fn closeOtherTabs(model: *Model, id: u32, fx: *Effects) void {
     syncUrls(model);
 }
 
-fn closeAllTabs(model: *Model, source_id: u32) void {
+fn closeAllTabsInPane(model: *Model, pane: Pane) void {
     const layout = model.activeLayout() orelse return;
-    const pane = paneForTab(layout, source_id) orelse return;
     for (paneOrder(layout, pane)) |candidate| {
         if (candidate <= max_file_tabs) layout.file_tabs[candidate - 1] = .{};
     }
@@ -854,6 +1159,91 @@ fn closeAllTabs(model: *Model, source_id: u32) void {
     syncUrls(model);
 }
 
+fn clearCloseRequest(model: *Model) void {
+    model.close_confirmation_open = false;
+    model.pending_close_project_id = 0;
+    model.pending_close_tab_id = 0;
+    model.pending_close_source_id = 0;
+    model.pending_close_intent = .none;
+    model.pending_editor_action = .none;
+}
+
+fn beginClosePrompt(model: *Model, id: u8, intent: CloseIntent, source_id: u8, pane: Pane) void {
+    const layout = model.activeLayout() orelse return;
+    if (id < 1 or id > max_file_tabs or !layout.file_tabs[id - 1].used or !layout.file_tabs[id - 1].dirty) return;
+    const target_pane = paneForTab(layout, id) orelse return;
+    if (layout.file_tabs[id - 1].kind == .markdown) layout.file_tabs[id - 1].markdown_editor_visible = true;
+    setPaneActive(layout, target_pane, id);
+    layout.active_pane = target_pane;
+    if (target_pane == .primary) model.primary_reload_token +%= 1 else model.secondary_reload_token +%= 1;
+    model.pending_close_project_id = model.active_project_id;
+    model.pending_close_tab_id = id;
+    model.pending_close_source_id = source_id;
+    model.pending_close_pane = pane;
+    model.pending_close_intent = intent;
+    model.pending_editor_action = .none;
+    model.close_confirmation_open = true;
+    syncUrls(model);
+}
+
+fn requestCloseTab(model: *Model, id: u32) void {
+    const layout = model.activeLayout() orelse return;
+    const pane = paneForTab(layout, id) orelse return;
+    if (id <= max_file_tabs and layout.file_tabs[id - 1].dirty) {
+        beginClosePrompt(model, @intCast(id), .single, @intCast(id), pane);
+        return;
+    }
+    closeTabNow(model, id);
+}
+
+fn requestCloseOtherTabs(model: *Model, source_id: u32, fx: *Effects) void {
+    const layout = model.activeLayout() orelse return;
+    const pane = paneForTab(layout, source_id) orelse return;
+    for (paneOrder(layout, pane)) |candidate| {
+        if (candidate != source_id and candidate <= max_file_tabs and layout.file_tabs[candidate - 1].dirty) {
+            beginClosePrompt(model, candidate, .others, @intCast(source_id), pane);
+            return;
+        }
+    }
+    closeOtherTabsNow(model, source_id, fx);
+}
+
+fn requestCloseAllInPane(model: *Model, pane: Pane, fx: *Effects) void {
+    _ = fx;
+    const layout = model.activeLayout() orelse return;
+    for (paneOrder(layout, pane)) |candidate| {
+        if (candidate <= max_file_tabs and layout.file_tabs[candidate - 1].dirty) {
+            beginClosePrompt(model, candidate, .all, 0, pane);
+            return;
+        }
+    }
+    closeAllTabsInPane(model, pane);
+}
+
+fn requestCloseAllTabs(model: *Model, source_id: u32, fx: *Effects) void {
+    const layout = model.activeLayout() orelse return;
+    const pane = paneForTab(layout, source_id) orelse return;
+    requestCloseAllInPane(model, pane, fx);
+}
+
+fn completePendingClose(model: *Model, fx: *Effects) void {
+    if (model.pending_close_project_id != model.active_project_id) {
+        clearCloseRequest(model);
+        return;
+    }
+    const tab_id = model.pending_close_tab_id;
+    const source_id = model.pending_close_source_id;
+    const pane = model.pending_close_pane;
+    const intent = model.pending_close_intent;
+    clearCloseRequest(model);
+    closeTabNow(model, tab_id);
+    switch (intent) {
+        .others => requestCloseOtherTabs(model, source_id, fx),
+        .all => requestCloseAllInPane(model, pane, fx),
+        .none, .single => {},
+    }
+}
+
 fn openTerminalIn(model: *Model, pane_id: u32, fx: *Effects) void {
     const layout = model.activeLayout() orelse return;
     const pane: Pane = if (pane_id == 2) .secondary else .primary;
@@ -869,10 +1259,12 @@ fn openTerminalIn(model: *Model, pane_id: u32, fx: *Effects) void {
     activateTab(model, id, fx);
 }
 
-fn dragDestination(layout: *LayoutState, event: TabDragMessage) Pane {
-    const content_width = @max(@as(f32, 1), event.viewWidth - 64);
+fn dragDestination(model: *Model, event: TabDragMessage) Pane {
+    const layout = model.activeLayout() orelse return .primary;
+    const sidebar_width = event.viewWidth * model.project_sidebar_fraction;
+    const content_width = @max(@as(f32, 1), event.viewWidth - sidebar_width);
     const explorer_width = if (layout.explorer_open) content_width * layout.explorer_fraction else 0;
-    const workspace_x = 64 + explorer_width;
+    const workspace_x = sidebar_width + explorer_width;
     const workspace_width = @max(@as(f32, 1), event.viewWidth - workspace_x);
     if (!layout.secondary_panel_open) {
         if (event.x > workspace_x + workspace_width * 0.72) {
@@ -893,10 +1285,12 @@ fn dragDestination(layout: *LayoutState, event: TabDragMessage) Pane {
     };
 }
 
-fn dragInsertionIndex(layout: *const LayoutState, pane: Pane, event: TabDragMessage) usize {
-    const content_width = @max(@as(f32, 1), event.viewWidth - 64);
+fn dragInsertionIndex(model: *const Model, pane: Pane, event: TabDragMessage) usize {
+    const layout = model.activeLayoutConst() orelse return 0;
+    const sidebar_width = event.viewWidth * model.project_sidebar_fraction;
+    const content_width = @max(@as(f32, 1), event.viewWidth - sidebar_width);
     const explorer_width = if (layout.explorer_open) content_width * layout.explorer_fraction else 0;
-    const workspace_x = 64 + explorer_width;
+    const workspace_x = sidebar_width + explorer_width;
     const workspace_width = @max(@as(f32, 1), event.viewWidth - workspace_x);
     var origin = workspace_x;
     var width = workspace_width;
@@ -916,10 +1310,10 @@ fn completeTabDrop(model: *Model, event: TabDragMessage, fx: *Effects) void {
     const id = event.sourceId;
     const source = paneForTab(layout, id) orelse return;
     const source_index = tabIndex(layout, source, id) orelse return;
-    const destination = dragDestination(layout, event);
+    const destination = dragDestination(model, event);
     _ = removeTabRaw(layout, source, source_index);
     syncPaneActive(layout, source);
-    insertTabRaw(layout, destination, @intCast(id), dragInsertionIndex(layout, destination, event));
+    insertTabRaw(layout, destination, @intCast(id), dragInsertionIndex(model, destination, event));
     setPaneActive(layout, destination, @intCast(id));
     layout.active_pane = destination;
     if (source == .secondary and destination != .secondary and layout.secondary_tab_count == 0) layout.secondary_panel_open = false;
@@ -945,6 +1339,21 @@ fn setSplit(model: *Model, mode: SplitMode) void {
     const layout = model.activeLayout() orelse return;
     layout.split_mode = mode;
     layout.secondary_panel_open = true;
+}
+
+fn toggleMarkdownSurface(model: *Model, pane_id: u32, editor: bool) void {
+    const pane: Pane = if (pane_id == 2) .secondary else .primary;
+    const layout = model.activeLayout() orelse return;
+    const slot = activeFileSlot(layout, pane) orelse return;
+    const tab = &layout.file_tabs[slot];
+    if (tab.kind != .markdown) return;
+    if (editor) {
+        if (tab.markdown_editor_visible and !tab.markdown_preview_visible) return;
+        tab.markdown_editor_visible = !tab.markdown_editor_visible;
+    } else {
+        if (tab.markdown_preview_visible and !tab.markdown_editor_visible) return;
+        tab.markdown_preview_visible = !tab.markdown_preview_visible;
+    }
 }
 
 fn isSafeRelativePath(path: []const u8) bool {
@@ -1054,6 +1463,9 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .term_two_state => |state| if (model.activeLayout()) |layout| {
             layout.term_two_scrollback = state.scrollback;
         },
+        .project_sidebar_resized => |fraction| {
+            model.project_sidebar_fraction = std.math.clamp(fraction, 0.11, 0.28);
+        },
         .explorer_resized => |fraction| if (model.activeLayout()) |layout| {
             layout.explorer_fraction = fraction;
         },
@@ -1068,17 +1480,79 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .activate_tab => |id| activateTab(model, id, fx),
         .drag_tab => |event| handleTabDrag(model, event, fx),
-        .close_tab => |id| closeTab(model, id),
-        .close_other_tabs => |id| closeOtherTabs(model, id, fx),
-        .close_all_tabs => |id| closeAllTabs(model, id),
+        .drag_project => |event| handleProjectDrag(model, event),
+        .close_tab => |id| requestCloseTab(model, id),
+        .close_other_tabs => |id| requestCloseOtherTabs(model, id, fx),
+        .close_all_tabs => |id| requestCloseAllTabs(model, id, fx),
+        .save_and_close_tab => if (model.close_confirmation_open) {
+            model.pending_editor_action = .save_and_close;
+        },
+        .discard_and_close_tab => if (model.close_confirmation_open) {
+            model.pending_editor_action = .discard_and_close;
+        },
+        .cancel_close_tab => clearCloseRequest(model),
         .copy_path => |id| copyTabPath(model, id, true, fx),
         .copy_relative_path => |id| copyTabPath(model, id, false, fx),
         .reveal_in_finder => |id| fx.hostSend("native-sdk.os.revealPath", fullPathForTab(model, id)),
         .open_terminal_in => |pane_id| openTerminalIn(model, pane_id, fx),
         .split_horizontal => setSplit(model, .horizontal),
         .split_vertical => setSplit(model, .vertical),
-        .select_project => |project_id| selectProject(model, project_id),
-        .open_add_project => model.add_project_open = true,
+        .select_project => |project_id| {
+            model.project_menu_open = false;
+            model.project_menu_id = 0;
+            selectProject(model, project_id);
+        },
+        .hover_project => |project_id| {
+            if (project_id > 0 and project_id <= model.project_count) model.hovered_project_id = project_id;
+        },
+        .leave_project => |project_id| {
+            if (model.hovered_project_id == project_id) model.hovered_project_id = 0;
+        },
+        .toggle_project_menu => |project_id| {
+            if (project_id == 0 or project_id > model.project_count) return;
+            const was_same = model.project_menu_open and model.project_menu_id == project_id;
+            model.project_menu_open = !was_same;
+            model.project_menu_id = if (was_same) 0 else project_id;
+        },
+        .close_project_menu => {
+            model.project_menu_open = false;
+            model.project_menu_id = 0;
+        },
+        .close_project => |project_id| closeProject(model, project_id, false, fx),
+        .remove_project => |project_id| closeProject(model, project_id, true, fx),
+        .begin_rename_project => |project_id| {
+            if (project_id == 0 or project_id > model.project_count) return;
+            const project = &model.projects[project_id - 1];
+            model.rename_project_buffer.set(project.displayName());
+            model.rename_project_id = project_id;
+            model.rename_project_open = true;
+            model.project_menu_open = false;
+            model.project_menu_id = 0;
+        },
+        .rename_project_input => |edit| model.rename_project_buffer.apply(edit),
+        .confirm_rename_project => {
+            if (model.rename_project_open and model.rename_project_id > 0 and model.rename_project_id <= model.project_count) {
+                const name = std.mem.trim(u8, model.rename_project_buffer.text(), " \t\r\n");
+                const project = &model.projects[model.rename_project_id - 1];
+                project.setDisplayName(name);
+                for (model.recent_projects[0..model.recent_count]) |*recent| {
+                    if (std.mem.eql(u8, recent.path(), project.path())) recent.setDisplayName(name);
+                }
+            }
+            model.rename_project_open = false;
+            model.rename_project_id = 0;
+            model.rename_project_buffer.clear();
+        },
+        .cancel_rename_project => {
+            model.rename_project_open = false;
+            model.rename_project_id = 0;
+            model.rename_project_buffer.clear();
+        },
+        .open_add_project => {
+            model.project_menu_open = false;
+            model.project_menu_id = 0;
+            model.add_project_open = true;
+        },
         .close_add_project => {
             model.add_project_open = false;
             model.directory_picker_requested = false;
@@ -1123,15 +1597,38 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.tree_reload_token +%= 1;
             syncUrls(model);
         },
+        .toggle_primary_markdown_editor => toggleMarkdownSurface(model, 1, true),
+        .toggle_primary_markdown_preview => toggleMarkdownSurface(model, 1, false),
+        .toggle_secondary_markdown_editor => toggleMarkdownSurface(model, 2, true),
+        .toggle_secondary_markdown_preview => toggleMarkdownSurface(model, 2, false),
+        .toggle_markdown_editor => |pane_id| toggleMarkdownSurface(model, pane_id, true),
+        .toggle_markdown_preview => |pane_id| toggleMarkdownSurface(model, pane_id, false),
         .open_file => |message| openFile(model, message, fx),
         .markdown_saved => |message| {
             if (message.project_id == model.active_project_id) {
                 const layout = model.activeLayout() orelse return;
-                if (message.slot >= 1 and message.slot <= max_file_tabs and layout.file_tabs[message.slot - 1].kind == .markdown) {
-                    layout.file_tabs[message.slot - 1].setMarkdown(message.content);
+                if (message.slot >= 1 and message.slot <= max_file_tabs and layout.file_tabs[message.slot - 1].used) {
+                    const tab = &layout.file_tabs[message.slot - 1];
+                    tab.dirty = false;
+                    if (tab.kind == .markdown) tab.setMarkdown(message.content);
+                    if (message.close_after_save and
+                        model.pending_close_project_id == message.project_id and
+                        model.pending_close_tab_id == message.slot and
+                        model.pending_editor_action == .save_and_close)
+                    {
+                        completePendingClose(model, fx);
+                    }
                 }
             }
         },
+        .editor_dirty_changed => |message| {
+            if (message.project_id == model.active_project_id and message.slot >= 1 and message.slot <= max_file_tabs) {
+                const layout = model.activeLayout() orelse return;
+                const tab = &layout.file_tabs[message.slot - 1];
+                if (tab.used) tab.dirty = message.dirty;
+            }
+        },
+        .editor_discarded => completePendingClose(model, fx),
         .refresh_files => model.tree_reload_token +%= 1,
         .finish_project_switch => model.project_switching = false,
     }
@@ -1145,7 +1642,7 @@ fn parkedPane(label: []const u8, url: []const u8, reload_token: u64) DocyrusApp.
 }
 
 fn modalOpen(model: *const Model) bool {
-    return model.add_project_open or model.settings_open or model.project_switching;
+    return model.add_project_open or model.settings_open or model.close_confirmation_open or model.rename_project_open or model.project_menu_open or model.project_switching;
 }
 
 pub fn webPanes(model: *const Model, out: []DocyrusApp.WebViewPane) usize {
@@ -1213,6 +1710,141 @@ test "tab dragging mutates only when the drop completes" {
     try std.testing.expectEqualSlices(u8, &before, &model.projects[0].layout.primary_order);
     handleTabDrag(&model, .{ .sourceId = 2, .phase = 1, .x = 1100, .y = 60, .viewWidth = 1200, .viewHeight = 800 }, &fx);
     try std.testing.expectEqual(Pane.secondary, paneForTab(&model.projects[0].layout, 2).?);
+}
+
+test "project sidebar defaults to 200 points and home paths use tilde" {
+    var model: Model = .{};
+    model.setHomePath("/Users/tester");
+    _ = addProject(&model, "/Users/tester/Dev/sample").?;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const projects = model.openProjects(arena.allocator());
+    try std.testing.expectApproxEqAbs(@as(f32, 200.0 / window_width), model.project_sidebar_fraction, 0.0001);
+    try std.testing.expectEqualStrings("sample", projects[0].name);
+    try std.testing.expectEqualStrings("~/Dev/sample", projects[0].display_path);
+}
+
+test "project actions appear only while their card is hovered or menu is open" {
+    var model: Model = .{};
+    const project_id = addProject(&model, "/tmp/project").?;
+    var fx: Effects = undefined;
+
+    var initial_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer initial_arena.deinit();
+    try std.testing.expect(!model.openProjects(initial_arena.allocator())[0].show_actions);
+
+    update(&model, .{ .hover_project = project_id }, &fx);
+    var hover_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer hover_arena.deinit();
+    try std.testing.expect(model.openProjects(hover_arena.allocator())[0].show_actions);
+
+    update(&model, .{ .toggle_project_menu = project_id }, &fx);
+    update(&model, .{ .leave_project = project_id }, &fx);
+    var menu_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer menu_arena.deinit();
+    const menu_project = model.openProjects(menu_arena.allocator())[0];
+    try std.testing.expect(menu_project.show_actions);
+    try std.testing.expect(menu_project.actions_open);
+
+    update(&model, .close_project_menu, &fx);
+    var closed_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer closed_arena.deinit();
+    try std.testing.expect(!model.openProjects(closed_arena.allocator())[0].show_actions);
+}
+
+test "project dragging changes visual order without changing project identity" {
+    var model: Model = .{};
+    const first = addProject(&model, "/tmp/first").?;
+    const second = addProject(&model, "/tmp/second").?;
+    const third = addProject(&model, "/tmp/third").?;
+    model.active_project_id = second;
+    model.projects[second - 1].layout.explorer_open = false;
+
+    handleProjectDrag(&model, .{ .sourceId = first, .phase = 0, .y = 50, .viewHeight = 800 });
+    handleProjectDrag(&model, .{ .sourceId = first, .phase = 1, .y = 170, .viewHeight = 800 });
+
+    const expected_order = [_]u8{ @intCast(second), @intCast(third), @intCast(first) };
+    try std.testing.expectEqualSlices(u8, &expected_order, model.project_order[0..3]);
+    try std.testing.expectEqual(second, model.active_project_id);
+    try std.testing.expect(!model.projects[second - 1].layout.explorer_open);
+}
+
+test "project rename is display-only and survives in recent projects" {
+    var model: Model = .{};
+    const project_id = addProject(&model, "/tmp/original-folder").?;
+    var fx: Effects = undefined;
+    update(&model, .{ .begin_rename_project = project_id }, &fx);
+    model.rename_project_buffer.set("Friendly Workspace");
+    update(&model, .confirm_rename_project, &fx);
+
+    try std.testing.expectEqualStrings("/tmp/original-folder", model.projects[project_id - 1].path());
+    try std.testing.expectEqualStrings("Friendly Workspace", model.projects[project_id - 1].displayName());
+    try std.testing.expectEqualStrings("Friendly Workspace", model.recent_projects[0].displayName());
+}
+
+test "closing keeps a project recent while removing forgets it" {
+    var model: Model = .{};
+    const first = addProject(&model, "/tmp/first").?;
+    _ = addProject(&model, "/tmp/second").?;
+    model.active_project_id = first;
+    var fx: Effects = undefined;
+
+    closeProject(&model, first, false, &fx);
+    try std.testing.expectEqual(@as(u8, 1), model.project_count);
+    try std.testing.expectEqualStrings("/tmp/second", model.workspace_path());
+    try std.testing.expect(model.recent_count > 0);
+
+    closeProject(&model, 1, true, &fx);
+    try std.testing.expectEqual(@as(u8, 0), model.project_count);
+    try std.testing.expect(model.findProject("/tmp/second") == null);
+    for (model.recent_projects[0..model.recent_count]) |*recent| {
+        try std.testing.expect(!std.mem.eql(u8, recent.path(), "/tmp/second"));
+    }
+}
+
+test "dirty file tabs require confirmation and save before closing" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx: Effects = undefined;
+    openFile(&model, .{ .project_id = 1, .path = "notes.txt" }, &fx);
+    update(&model, .{ .editor_dirty_changed = .{ .project_id = 1, .slot = 1, .dirty = true } }, &fx);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const tabs = model.primaryTabs(arena.allocator());
+    try std.testing.expectEqualStrings("notes.txt", tabs[0].title);
+    try std.testing.expect(tabs[0].dirty);
+    update(&model, .{ .close_tab = 1 }, &fx);
+    try std.testing.expect(model.close_confirmation_open);
+    try std.testing.expectEqual(@as(u8, 1), model.projects[0].layout.primary_tab_count);
+
+    update(&model, .cancel_close_tab, &fx);
+    try std.testing.expect(!model.close_confirmation_open);
+    try std.testing.expect(model.projects[0].layout.file_tabs[0].dirty);
+
+    update(&model, .{ .close_tab = 1 }, &fx);
+    update(&model, .save_and_close_tab, &fx);
+    try std.testing.expectEqual(EditorAction.save_and_close, model.pending_editor_action);
+    update(&model, .{ .markdown_saved = .{ .project_id = 1, .slot = 1, .content = "saved", .close_after_save = true } }, &fx);
+    try std.testing.expect(!model.close_confirmation_open);
+    try std.testing.expectEqual(@as(u8, 0), model.projects[0].layout.primary_tab_count);
+}
+
+test "markdown editor and preview toggles always leave one surface visible" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx: Effects = undefined;
+    openFile(&model, .{ .project_id = 1, .path = "README.md", .markdown = "# Test" }, &fx);
+    update(&model, .{ .toggle_markdown_preview = 1 }, &fx);
+    try std.testing.expect(model.primary_markdown_editor_visible());
+    try std.testing.expect(!model.primary_markdown_preview_visible());
+    update(&model, .{ .toggle_markdown_editor = 1 }, &fx);
+    try std.testing.expect(model.primary_markdown_editor_visible());
+    update(&model, .{ .toggle_markdown_preview = 1 }, &fx);
+    update(&model, .{ .toggle_markdown_editor = 1 }, &fx);
+    try std.testing.expect(!model.primary_markdown_editor_visible());
+    try std.testing.expect(model.primary_markdown_preview_visible());
 }
 
 test "modals and project switches park every child webview" {
@@ -1392,7 +2024,7 @@ const shell_windows = [_]native_sdk.ShellWindow{.{
 
 pub const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 
-pub fn appOptions(io: std.Io) DocyrusApp.Options {
+pub fn appOptions(_: std.Io) DocyrusApp.Options {
     return .{
         .name = "docyrus-open-ide",
         .scene = shell_scene,
@@ -1400,7 +2032,7 @@ pub fn appOptions(io: std.Io) DocyrusApp.Options {
         .update_fx = update,
         .init_fx = boot,
         .view = CompiledAppView.build,
-        .markup = if (builtin.mode == .Debug) .{ .source = app_markup, .watch_path = "src/app.native", .io = io } else null,
+        .markup = null,
         .web_panes = webPanes,
         .theme_state_fn = themeState,
     };
@@ -1419,6 +2051,13 @@ const BridgeWriteFile = struct {
     projectId: u32,
     slot: u32,
     content: []const u8,
+    closeAfterSave: bool = false,
+};
+
+const BridgeEditorDirty = struct {
+    projectId: u32,
+    slot: u32,
+    dirty: bool,
 };
 
 const AppHost = struct {
@@ -1500,7 +2139,10 @@ const AppHost = struct {
         var buffer: [12 * 1024]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buffer);
         writer.print("theme={s}\n", .{themeName(self.ui.model.theme_mode)}) catch return;
-        for (self.ui.model.recent_projects[0..self.ui.model.recent_count]) |*recent| writer.print("recent={s}\n", .{recent.path()}) catch return;
+        writer.print("sidebar={d}\n", .{self.ui.model.project_sidebar_fraction}) catch return;
+        for (self.ui.model.recent_projects[0..self.ui.model.recent_count]) |*recent| {
+            writer.print("recent={s}\t{s}\n", .{ recent.path(), recent.name_buffer[0..recent.name_len] }) catch return;
+        }
         std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.preferences_path[0..self.preferences_path_len], .data = writer.buffered() }) catch {};
     }
 
@@ -1578,9 +2220,80 @@ const AppHost = struct {
         var absolute_buffer: [2048]u8 = undefined;
         const absolute = try fullPath(project, tab.path(), &absolute_buffer);
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = absolute, .data = parsed.value.content });
-        if (tab.kind == .markdown) {
-            const runtime = self.runtime orelse return error.RuntimeNotReady;
-            try self.ui.dispatch(runtime, invocation.source.window_id, .{ .markdown_saved = .{ .project_id = parsed.value.projectId, .slot = parsed.value.slot, .content = parsed.value.content } });
+        const runtime = self.runtime orelse return error.RuntimeNotReady;
+        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .markdown_saved = .{
+            .project_id = parsed.value.projectId,
+            .slot = parsed.value.slot,
+            .content = parsed.value.content,
+            .close_after_save = parsed.value.closeAfterSave,
+        } });
+        var writer: std.Io.Writer = .fixed(output);
+        try writer.writeAll("true");
+        return writer.buffered();
+    }
+
+    fn editorDirty(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *AppHost = @ptrCast(@alignCast(context));
+        if (!isEditorView(invocation.source.webview_label)) return error.InvalidBridgeSource;
+        const parsed = try std.json.parseFromSlice(BridgeEditorDirty, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        _ = try self.validateBridgeProject(parsed.value.projectId);
+        if (parsed.value.slot < 1 or parsed.value.slot > max_file_tabs) return error.UnknownTab;
+        const runtime = self.runtime orelse return error.RuntimeNotReady;
+        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .editor_dirty_changed = .{
+            .project_id = parsed.value.projectId,
+            .slot = parsed.value.slot,
+            .dirty = parsed.value.dirty,
+        } });
+        var writer: std.Io.Writer = .fixed(output);
+        try writer.writeAll("true");
+        return writer.buffered();
+    }
+
+    fn editorAction(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *AppHost = @ptrCast(@alignCast(context));
+        if (!isEditorView(invocation.source.webview_label)) return error.InvalidBridgeSource;
+        const parsed = try std.json.parseFromSlice(BridgeProjectSlot, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        _ = try self.validateBridgeProject(parsed.value.projectId);
+        const matches = self.ui.model.pending_close_project_id == parsed.value.projectId and
+            self.ui.model.pending_close_tab_id == parsed.value.slot;
+        const action = if (!matches)
+            "none"
+        else switch (self.ui.model.pending_editor_action) {
+            .save_and_close => "saveAndClose",
+            .discard_and_close => "discardAndClose",
+            .none => "none",
+        };
+        return native_sdk.bridge.writeJsonStringValue(output, action);
+    }
+
+    fn discardAndClose(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *AppHost = @ptrCast(@alignCast(context));
+        if (!isEditorView(invocation.source.webview_label)) return error.InvalidBridgeSource;
+        const parsed = try std.json.parseFromSlice(BridgeProjectSlot, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        _ = try self.validateBridgeProject(parsed.value.projectId);
+        if (self.ui.model.pending_close_project_id != parsed.value.projectId or
+            self.ui.model.pending_close_tab_id != parsed.value.slot or
+            self.ui.model.pending_editor_action != .discard_and_close) return error.NoPendingClose;
+        const runtime = self.runtime orelse return error.RuntimeNotReady;
+        try self.ui.dispatch(runtime, invocation.source.window_id, .editor_discarded);
+        var writer: std.Io.Writer = .fixed(output);
+        try writer.writeAll("true");
+        return writer.buffered();
+    }
+
+    fn editorActionFailed(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *AppHost = @ptrCast(@alignCast(context));
+        if (!isEditorView(invocation.source.webview_label)) return error.InvalidBridgeSource;
+        const parsed = try std.json.parseFromSlice(BridgeProjectSlot, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        _ = try self.validateBridgeProject(parsed.value.projectId);
+        if (self.ui.model.pending_close_project_id == parsed.value.projectId and
+            self.ui.model.pending_close_tab_id == parsed.value.slot)
+        {
+            self.ui.model.pending_editor_action = .none;
         }
         var writer: std.Io.Writer = .fixed(output);
         try writer.writeAll("true");
@@ -1709,8 +2422,16 @@ fn loadPreferences(model: *Model, io: std.Io, path: []const u8) void {
         if (std.mem.startsWith(u8, line, "theme=")) {
             const value = line[6..];
             if (std.mem.eql(u8, value, "light")) model.theme_mode = .light else if (std.mem.eql(u8, value, "dark")) model.theme_mode = .dark else model.theme_mode = .system;
+        } else if (std.mem.startsWith(u8, line, "sidebar=")) {
+            const fraction = std.fmt.parseFloat(f32, line[8..]) catch continue;
+            model.project_sidebar_fraction = std.math.clamp(fraction, 0.11, 0.28);
         } else if (std.mem.startsWith(u8, line, "recent=")) {
-            addRecentProject(model, line[7..]);
+            const entry = line[7..];
+            if (std.mem.indexOfScalar(u8, entry, '\t')) |separator| {
+                addRecentProjectNamed(model, entry[0..separator], entry[separator + 1 ..]);
+            } else {
+                addRecentProject(model, entry);
+            }
         }
     }
 }
@@ -1730,6 +2451,7 @@ fn resolvePreferencesPath(init: std.process.Init, output: []u8) ?[]const u8 {
 
 pub fn main(init: std.process.Init) !void {
     var initial_model: Model = .{};
+    if (init.environ_map.get("HOME")) |home_path| initial_model.setHomePath(home_path);
     var preferences_path: [1024]u8 = undefined;
     const resolved_preferences = resolvePreferencesPath(init, &preferences_path);
     if (resolved_preferences) |path| loadPreferences(&initial_model, init.io, path);
@@ -1763,12 +2485,20 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "workspace.openPath", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
         .{ .name = "workspace.readFile", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
         .{ .name = "workspace.writeFile", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
+        .{ .name = "workspace.editorDirty", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
+        .{ .name = "workspace.editorAction", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
+        .{ .name = "workspace.discardAndClose", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
+        .{ .name = "workspace.editorActionFailed", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
     };
     const bridge_handlers = [_]native_sdk.bridge.Handler{
         .{ .name = "workspace.listTree", .context = &host, .invoke_fn = AppHost.listTree },
         .{ .name = "workspace.openPath", .context = &host, .invoke_fn = AppHost.openPath },
         .{ .name = "workspace.readFile", .context = &host, .invoke_fn = AppHost.readFile },
         .{ .name = "workspace.writeFile", .context = &host, .invoke_fn = AppHost.writeFile },
+        .{ .name = "workspace.editorDirty", .context = &host, .invoke_fn = AppHost.editorDirty },
+        .{ .name = "workspace.editorAction", .context = &host, .invoke_fn = AppHost.editorAction },
+        .{ .name = "workspace.discardAndClose", .context = &host, .invoke_fn = AppHost.discardAndClose },
+        .{ .name = "workspace.editorActionFailed", .context = &host, .invoke_fn = AppHost.editorActionFailed },
     };
 
     try runner.runWithOptions(app, .{

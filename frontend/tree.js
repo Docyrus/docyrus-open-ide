@@ -1,4 +1,4 @@
-import { FileTree } from "@pierre/trees";
+import { FileTree, themeToTreeStyles } from "@pierre/trees";
 
 const params = new URLSearchParams(window.location.search);
 const projectId = Number(params.get("project") || 0);
@@ -9,9 +9,57 @@ const status = document.querySelector("#tree-status");
 let tree;
 let lastOpenedPath = "";
 
+const themes = {
+  light: {
+    type: "light",
+    colors: {
+      "sideBar.background": "#f7f7f8",
+      "sideBar.foreground": "#202124",
+      "sideBarSectionHeader.foreground": "#6d6f73",
+      "sideBar.border": "rgba(0, 0, 0, 0.1)",
+      "list.hoverBackground": "rgba(0, 122, 255, 0.08)",
+      "list.activeSelectionBackground": "rgba(0, 122, 255, 0.14)",
+      "list.activeSelectionForeground": "#202124",
+      "list.focusOutline": "#007aff",
+      "input.background": "#ffffff",
+      "input.border": "rgba(0, 0, 0, 0.16)",
+      "scrollbarSlider.background": "rgba(0, 0, 0, 0.22)",
+    },
+  },
+  dark: {
+    type: "dark",
+    colors: {
+      "sideBar.background": "#18191b",
+      "sideBar.foreground": "#f1f1f2",
+      "sideBarSectionHeader.foreground": "#a8aaae",
+      "sideBar.border": "rgba(255, 255, 255, 0.11)",
+      "list.hoverBackground": "rgba(255, 255, 255, 0.08)",
+      "list.activeSelectionBackground": "rgba(10, 132, 255, 0.28)",
+      "list.activeSelectionForeground": "#ffffff",
+      "list.focusOutline": "#0a84ff",
+      "input.background": "#111214",
+      "input.border": "rgba(255, 255, 255, 0.16)",
+      "scrollbarSlider.background": "rgba(255, 255, 255, 0.24)",
+    },
+  },
+};
+
+function resolvedThemeName() {
+  return requestedTheme === "system" ? (systemDark.matches ? "dark" : "light") : requestedTheme;
+}
+
+function setElementStyles(element, styles) {
+  if (!element) return;
+  for (const [property, value] of Object.entries(styles)) {
+    if (property.startsWith("--")) element.style.setProperty(property, value);
+    else element.style[property] = value;
+  }
+}
+
 function applyTheme() {
-  const theme = requestedTheme === "system" ? (systemDark.matches ? "dark" : "light") : requestedTheme;
-  document.documentElement.dataset.theme = theme;
+  const themeName = resolvedThemeName();
+  document.documentElement.dataset.theme = themeName;
+  setElementStyles(tree?.getFileTreeContainer(), themeToTreeStyles(themes[themeName]));
 }
 
 async function invoke(command, payload) {
@@ -66,7 +114,7 @@ async function renderTree() {
       id: `workspace-files-${projectId}`,
       paths: Array.isArray(paths) ? paths : [],
       flattenEmptyDirectories: false,
-      initialExpansion: "open",
+      initialExpansion: "closed",
       search: true,
       density: "compact",
       onSelectionChange(selectedPaths) {
@@ -75,6 +123,7 @@ async function renderTree() {
       },
     });
     tree.render({ containerWrapper: mount });
+    applyTheme();
     const notes = [];
     if (truncated) notes.push("showing first 1,200");
     if (skipped > 0) notes.push(`${skipped} inaccessible skipped`);

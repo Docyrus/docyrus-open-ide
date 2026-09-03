@@ -14,7 +14,11 @@
             { "name": "workspace.listTree", "permissions": ["filesystem"], "origins": ["zero://app"] },
             { "name": "workspace.openPath", "permissions": ["filesystem"], "origins": ["zero://app"] },
             { "name": "workspace.readFile", "permissions": ["filesystem"], "origins": ["zero://app"] },
-            { "name": "workspace.writeFile", "permissions": ["filesystem"], "origins": ["zero://app"] }
+            { "name": "workspace.writeFile", "permissions": ["filesystem"], "origins": ["zero://app"] },
+            { "name": "workspace.editorDirty", "permissions": ["filesystem"], "origins": ["zero://app"] },
+            { "name": "workspace.editorAction", "permissions": ["filesystem"], "origins": ["zero://app"] },
+            { "name": "workspace.discardAndClose", "permissions": ["filesystem"], "origins": ["zero://app"] },
+            { "name": "workspace.editorActionFailed", "permissions": ["filesystem"], "origins": ["zero://app"] }
         ]
     },
     "frontend": {
