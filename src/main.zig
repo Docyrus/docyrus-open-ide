@@ -23,8 +23,13 @@ pub const tree_pane_anchor = "file-tree-pane";
 const bundle_id = "com.docyrus.open-ide";
 const max_projects: usize = 10;
 const max_recent_projects: usize = 10;
-const max_tabs: usize = 10;
 const max_file_tabs: usize = 8;
+// Terminals are ordinary tabs living above the file slots: tab ids
+// `max_file_tabs + 1 .. max_tabs` map one-to-one onto terminal indices, and
+// each index owns its own pty per project. The pane terminal button spends a
+// free index per click, so this is the ceiling on terminals a project can hold.
+const max_terminals: usize = 8;
+const max_tabs: usize = max_file_tabs + max_terminals;
 const max_panes: usize = 4;
 const required_web_pane_count: usize = max_panes + 1;
 const max_external_files: usize = 64;
@@ -238,12 +243,9 @@ const LayoutState = struct {
     pane_tab_counts: [max_panes]u8 = [_]u8{0} ** max_panes,
     pane_active_tabs: [max_panes]u8 = [_]u8{0} ** max_panes,
     file_tabs: [max_file_tabs]FileTab = [_]FileTab{.{}} ** max_file_tabs,
-    term_one_scrollback: u32 = 0,
-    term_two_scrollback: u32 = 0,
-    term_one_started: bool = false,
-    term_two_started: bool = false,
-    term_one_live: bool = false,
-    term_two_live: bool = false,
+    term_scrollback: [max_terminals]u32 = [_]u32{0} ** max_terminals,
+    term_started: [max_terminals]bool = [_]bool{false} ** max_terminals,
+    term_live: [max_terminals]bool = [_]bool{false} ** max_terminals,
 };
 
 const ExternalFile = struct {
@@ -707,36 +709,52 @@ pub const Model = struct {
         return paneFileKind(model, .quaternary) == .image;
     }
 
-    pub fn primary_uses_terminal_one(model: *const Model) bool {
-        return paneActive(model, .primary) == 9;
+    pub fn primary_uses_terminal(model: *const Model) bool {
+        return paneTerminal(model, .primary) != null;
     }
 
-    pub fn secondary_uses_terminal_one(model: *const Model) bool {
-        return paneActive(model, .secondary) == 9;
+    pub fn primary_terminal_key(model: *const Model) u64 {
+        return paneTerminalKey(model, .primary);
     }
 
-    pub fn tertiary_uses_terminal_one(model: *const Model) bool {
-        return paneActive(model, .tertiary) == 9;
+    pub fn primary_terminal_scrollback(model: *const Model) u32 {
+        return paneTerminalScrollback(model, .primary);
     }
 
-    pub fn quaternary_uses_terminal_one(model: *const Model) bool {
-        return paneActive(model, .quaternary) == 9;
+    pub fn secondary_uses_terminal(model: *const Model) bool {
+        return paneTerminal(model, .secondary) != null;
     }
 
-    pub fn primary_uses_terminal_two(model: *const Model) bool {
-        return paneActive(model, .primary) == 10;
+    pub fn secondary_terminal_key(model: *const Model) u64 {
+        return paneTerminalKey(model, .secondary);
     }
 
-    pub fn secondary_uses_terminal_two(model: *const Model) bool {
-        return paneActive(model, .secondary) == 10;
+    pub fn secondary_terminal_scrollback(model: *const Model) u32 {
+        return paneTerminalScrollback(model, .secondary);
     }
 
-    pub fn tertiary_uses_terminal_two(model: *const Model) bool {
-        return paneActive(model, .tertiary) == 10;
+    pub fn tertiary_uses_terminal(model: *const Model) bool {
+        return paneTerminal(model, .tertiary) != null;
     }
 
-    pub fn quaternary_uses_terminal_two(model: *const Model) bool {
-        return paneActive(model, .quaternary) == 10;
+    pub fn tertiary_terminal_key(model: *const Model) u64 {
+        return paneTerminalKey(model, .tertiary);
+    }
+
+    pub fn tertiary_terminal_scrollback(model: *const Model) u32 {
+        return paneTerminalScrollback(model, .tertiary);
+    }
+
+    pub fn quaternary_uses_terminal(model: *const Model) bool {
+        return paneTerminal(model, .quaternary) != null;
+    }
+
+    pub fn quaternary_terminal_key(model: *const Model) u64 {
+        return paneTerminalKey(model, .quaternary);
+    }
+
+    pub fn quaternary_terminal_scrollback(model: *const Model) u32 {
+        return paneTerminalScrollback(model, .quaternary);
     }
 
     pub fn primary_markdown_body(model: *const Model) []const u8 {
@@ -807,24 +825,6 @@ pub const Model = struct {
         return statusText(model, .quaternary, arena);
     }
 
-    pub fn shell_key(model: *const Model) u64 {
-        return terminalKey(model.active_project_id, 0);
-    }
-
-    pub fn secondary_shell_key(model: *const Model) u64 {
-        return terminalKey(model.active_project_id, 1);
-    }
-
-    pub fn term_one_scrollback(model: *const Model) u32 {
-        const layout = model.activeLayoutConst() orelse return 0;
-        return layout.term_one_scrollback;
-    }
-
-    pub fn term_two_scrollback(model: *const Model) u32 {
-        const layout = model.activeLayoutConst() orelse return 0;
-        return layout.term_two_scrollback;
-    }
-
     pub fn has_preview_image(model: *const Model) bool {
         return model.preview_image != 0;
     }
@@ -887,8 +887,10 @@ pub const Msg = union(enum) {
     pty: native_sdk.EffectPtyEvent,
     clipboard_result: native_sdk.EffectClipboardResult,
     image_loaded: native_sdk.EffectImageResult,
-    term_one_state: canvas.TerminalState,
-    term_two_state: canvas.TerminalState,
+    primary_term_state: canvas.TerminalState,
+    secondary_term_state: canvas.TerminalState,
+    tertiary_term_state: canvas.TerminalState,
+    quaternary_term_state: canvas.TerminalState,
     project_sidebar_resized: f32,
     explorer_resized: f32,
     split_resized: f32,
@@ -1002,29 +1004,39 @@ fn themeName(mode: ThemeMode) []const u8 {
 
 fn terminalKey(project_id: u32, terminal_index: u8) u64 {
     if (project_id == 0) return 0;
-    return (@as(u64, project_id - 1) * 2) + terminal_index + 1;
+    return (@as(u64, project_id - 1) * max_terminals) + terminal_index + 1;
+}
+
+const terminal_titles = [max_terminals][]const u8{
+    "Terminal",   "Terminal 2", "Terminal 3", "Terminal 4",
+    "Terminal 5", "Terminal 6", "Terminal 7", "Terminal 8",
+};
+
+/// The terminal a tab id names, or null for a file tab.
+fn terminalIndexForTab(id: u32) ?u8 {
+    if (id <= max_file_tabs or id > max_tabs) return null;
+    return @intCast(id - max_file_tabs - 1);
+}
+
+fn tabIdForTerminal(index: u8) u32 {
+    return @as(u32, index) + @as(u32, @intCast(max_file_tabs)) + 1;
 }
 
 fn tabTitle(layout: *const LayoutState, id: u32) []const u8 {
-    return switch (id) {
-        1...8 => layout.file_tabs[id - 1].title(),
-        9 => "Terminal",
-        10 => "Terminal 2",
-        else => "",
-    };
+    if (id >= 1 and id <= max_file_tabs) return layout.file_tabs[id - 1].title();
+    if (terminalIndexForTab(id)) |index| return terminal_titles[index];
+    return "";
 }
 
 fn tabIcon(layout: *const LayoutState, id: u32) []const u8 {
-    return switch (id) {
-        1...8 => switch (layout.file_tabs[id - 1].kind) {
-            .image => "image",
-            .markdown => "file-text",
-            .code => "code",
-            .text => "file",
-        },
-        9, 10 => "terminal",
-        else => "file",
+    if (id >= 1 and id <= max_file_tabs) return switch (layout.file_tabs[id - 1].kind) {
+        .image => "image",
+        .markdown => "file-text",
+        .code => "code",
+        .text => "file",
     };
+    if (terminalIndexForTab(id) != null) return "terminal";
+    return "file";
 }
 
 fn paneIndex(pane: Pane) usize {
@@ -1128,8 +1140,8 @@ fn statusText(model: *const Model, pane: Pane, arena: std.mem.Allocator) []const
     const layout = model.activeLayoutConst() orelse return "Ready";
     const id = paneActive(model, pane);
     if (id == 0) return "Ready";
-    if (id == 9 or id == 10) {
-        const live = if (id == 9) layout.term_one_live else layout.term_two_live;
+    if (terminalIndexForTab(id)) |terminal_index| {
+        const live = layout.term_live[terminal_index];
         return std.fmt.allocPrint(arena, "{s}  |  {s}", .{ model.workspace_path(), if (live) "terminal connected" else "terminal starting" }) catch "Terminal";
     }
     return std.fmt.allocPrint(arena, "{s}  |  UTF-8", .{tabTitle(layout, id)}) catch "Docyrus Open IDE";
@@ -1320,7 +1332,7 @@ fn closeProject(model: *Model, project_id: u32, forget: bool, fx: *Effects) void
     const project_index: usize = @intCast(project_id - 1);
     if (firstDirtyTab(&model.projects[project_index])) |dirty_tab| {
         if (model.active_project_id != project_id) selectProject(model, project_id);
-        requestCloseTab(model, dirty_tab);
+        requestCloseTab(model, dirty_tab, fx);
         return;
     }
 
@@ -1344,12 +1356,11 @@ fn closeProject(model: *Model, project_id: u32, forget: bool, fx: *Effects) void
     var affected_id = project_id;
     while (affected_id <= model.project_count) : (affected_id += 1) {
         const affected = &model.projects[affected_id - 1];
-        if (affected.layout.term_one_started) fx.ptyKill(terminalKey(affected_id, 0));
-        if (affected.layout.term_two_started) fx.ptyKill(terminalKey(affected_id, 1));
-        affected.layout.term_one_started = false;
-        affected.layout.term_two_started = false;
-        affected.layout.term_one_live = false;
-        affected.layout.term_two_live = false;
+        for (0..max_terminals) |index| {
+            if (affected.layout.term_started[index]) fx.ptyKill(terminalKey(affected_id, @intCast(index)));
+            affected.layout.term_started[index] = false;
+            affected.layout.term_live[index] = false;
+        }
     }
 
     var cursor = project_index;
@@ -1517,7 +1528,7 @@ fn activateTab(model: *Model, id: u32, fx: *Effects) void {
     if (paneForTab(layout, id) == null) insertTabRaw(layout, pane, @intCast(id), paneCount(layout, pane));
     setPaneActive(layout, pane, @intCast(id));
     layout.active_pane = pane;
-    if (id == 9 or id == 10) ensureTerminal(model, @intCast(id - 9), fx);
+    if (terminalIndexForTab(id)) |terminal_index| ensureTerminal(model, terminal_index, fx);
     if (id <= max_file_tabs and layout.file_tabs[id - 1].kind == .image) ensureImage(model, id, fx);
     bumpEditorReload(model, pane);
     syncUrls(model);
@@ -1589,7 +1600,7 @@ fn applyPathMove(model: *Model, message: PathMovedMessage) void {
     syncUrls(model);
 }
 
-fn applyPathDelete(model: *Model, message: PathDeletedMessage) void {
+fn applyPathDelete(model: *Model, message: PathDeletedMessage, fx: *Effects) void {
     if (message.project_id != model.active_project_id) return;
     const project = model.activeProjectConst() orelse return;
     if (project.kind != .folder) return;
@@ -1604,7 +1615,7 @@ fn applyPathDelete(model: *Model, message: PathDeletedMessage) void {
             (path.len > removed.len and std.mem.startsWith(u8, path, removed) and path[removed.len] == '/');
         // The file is already gone, so the unsaved-changes prompt has nothing
         // left to save. Drop the tab instead of asking.
-        if (affected) closeTabNow(model, @intCast(index + 1));
+        if (affected) closeTabNow(model, @intCast(index + 1), fx);
     }
 }
 
@@ -1632,7 +1643,20 @@ fn collapseEmptyPane(layout: *LayoutState, pane: Pane) void {
     }
 }
 
-fn closeTabNow(model: *Model, id: u32) void {
+/// Retire the terminal a tab id names: kill its pty and free the index so the
+/// pane button can spend it again. A no-op for file tabs and for a terminal
+/// that never started.
+fn releaseTerminalTab(model: *Model, id: u32, fx: *Effects) void {
+    const index = terminalIndexForTab(id) orelse return;
+    const layout = model.activeLayout() orelse return;
+    if (layout.term_started[index]) fx.ptyKill(terminalKey(model.active_project_id, index));
+    layout.term_started[index] = false;
+    layout.term_live[index] = false;
+    layout.term_scrollback[index] = 0;
+}
+
+fn closeTabNow(model: *Model, id: u32, fx: *Effects) void {
+    releaseTerminalTab(model, id, fx);
     const layout = model.activeLayout() orelse return;
     const pane = paneForTab(layout, id) orelse return;
     const index = tabIndex(layout, pane, id) orelse return;
@@ -1647,26 +1671,36 @@ fn closeTabNow(model: *Model, id: u32) void {
 fn closeOtherTabsNow(model: *Model, id: u32, fx: *Effects) void {
     const layout = model.activeLayout() orelse return;
     const pane = paneForTab(layout, id) orelse return;
-    const old_order = paneOrder(layout, pane);
-    for (old_order) |candidate| {
-        if (candidate <= max_file_tabs and candidate != id) layout.file_tabs[candidate - 1] = .{};
+    var retired: [max_tabs]u8 = undefined;
+    var retired_count: usize = 0;
+    for (paneOrder(layout, pane)) |candidate| {
+        if (candidate == id) continue;
+        if (candidate <= max_file_tabs) layout.file_tabs[candidate - 1] = .{};
+        retired[retired_count] = candidate;
+        retired_count += 1;
     }
+    for (retired[0..retired_count]) |candidate| releaseTerminalTab(model, candidate, fx);
     const pane_index = paneIndex(pane);
     layout.pane_orders[pane_index] = [_]u8{0} ** max_tabs;
     layout.pane_orders[pane_index][0] = @intCast(id);
     layout.pane_tab_counts[pane_index] = 1;
     setPaneActive(layout, pane, @intCast(id));
     layout.active_pane = pane;
-    if (id == 9 or id == 10) ensureTerminal(model, @intCast(id - 9), fx);
+    if (terminalIndexForTab(id)) |terminal_index| ensureTerminal(model, terminal_index, fx);
     bumpAllEditorReloads(model);
     syncUrls(model);
 }
 
-fn closeAllTabsInPane(model: *Model, pane: Pane) void {
+fn closeAllTabsInPane(model: *Model, pane: Pane, fx: *Effects) void {
     const layout = model.activeLayout() orelse return;
+    var retired: [max_tabs]u8 = undefined;
+    var retired_count: usize = 0;
     for (paneOrder(layout, pane)) |candidate| {
         if (candidate <= max_file_tabs) layout.file_tabs[candidate - 1] = .{};
+        retired[retired_count] = candidate;
+        retired_count += 1;
     }
+    for (retired[0..retired_count]) |candidate| releaseTerminalTab(model, candidate, fx);
     const pane_index = paneIndex(pane);
     layout.pane_orders[pane_index] = [_]u8{0} ** max_tabs;
     layout.pane_tab_counts[pane_index] = 0;
@@ -1703,14 +1737,14 @@ fn beginClosePrompt(model: *Model, id: u8, intent: CloseIntent, source_id: u8, p
     syncUrls(model);
 }
 
-fn requestCloseTab(model: *Model, id: u32) void {
+fn requestCloseTab(model: *Model, id: u32, fx: *Effects) void {
     const layout = model.activeLayout() orelse return;
     const pane = paneForTab(layout, id) orelse return;
     if (id <= max_file_tabs and layout.file_tabs[id - 1].dirty) {
         beginClosePrompt(model, @intCast(id), .single, @intCast(id), pane);
         return;
     }
-    closeTabNow(model, id);
+    closeTabNow(model, id, fx);
 }
 
 fn requestCloseOtherTabs(model: *Model, source_id: u32, fx: *Effects) void {
@@ -1726,7 +1760,6 @@ fn requestCloseOtherTabs(model: *Model, source_id: u32, fx: *Effects) void {
 }
 
 fn requestCloseAllInPane(model: *Model, pane: Pane, fx: *Effects) void {
-    _ = fx;
     const layout = model.activeLayout() orelse return;
     for (paneOrder(layout, pane)) |candidate| {
         if (candidate <= max_file_tabs and layout.file_tabs[candidate - 1].dirty) {
@@ -1734,7 +1767,7 @@ fn requestCloseAllInPane(model: *Model, pane: Pane, fx: *Effects) void {
             return;
         }
     }
-    closeAllTabsInPane(model, pane);
+    closeAllTabsInPane(model, pane, fx);
 }
 
 fn requestCloseAllTabs(model: *Model, source_id: u32, fx: *Effects) void {
@@ -1753,7 +1786,7 @@ fn completePendingClose(model: *Model, fx: *Effects) void {
     const pane = model.pending_close_pane;
     const intent = model.pending_close_intent;
     clearCloseRequest(model);
-    closeTabNow(model, tab_id);
+    closeTabNow(model, tab_id, fx);
     switch (intent) {
         .others => requestCloseOtherTabs(model, source_id, fx),
         .all => requestCloseAllInPane(model, pane, fx),
@@ -1761,26 +1794,26 @@ fn completePendingClose(model: *Model, fx: *Effects) void {
     }
 }
 
-// A pane holds terminals like any other tab, so a pane already showing one
-// opens the second beside it rather than re-focusing the first. The workspace
-// owns exactly two terminal tabs (9 and 10, one pty each per project), so the
-// order is: spend an unopened terminal first, then fall back to focusing one
-// this pane already holds, and only then adopt a terminal parked elsewhere -
-// a click on a pane's terminal button always leaves that pane showing one.
+// The pane's terminal button always opens a NEW terminal beside whatever the
+// pane already holds - terminals are ordinary tabs, so a pane stacks as many as
+// it likes. Closing a terminal tab frees its index (and kills its pty), so the
+// `max_terminals` ceiling is on terminals open at once, not on clicks. Once
+// every index is spent, focus one this pane already holds rather than doing
+// nothing, so the button never reads as dead.
 fn openTerminalIn(model: *Model, pane_id: u32, fx: *Effects) void {
     const layout = model.activeLayout() orelse return;
     const pane = paneFromId(pane_id) orelse return;
+    if (paneCount(layout, pane) >= max_tabs) return;
     layout.active_pane = pane;
 
-    if (paneForTab(layout, 9) == null) return activateTab(model, 9, fx);
-    if (paneForTab(layout, 10) == null) return activateTab(model, 10, fx);
-
-    for (paneOrder(layout, pane)) |id| {
-        if (id == 9 or id == 10) return activateTab(model, id, fx);
+    for (0..max_terminals) |index| {
+        const id = tabIdForTerminal(@intCast(index));
+        if (paneForTab(layout, id) == null) return activateTab(model, id, fx);
     }
 
-    moveTabToPane(layout, 10, pane);
-    activateTab(model, 10, fx);
+    for (paneOrder(layout, pane)) |id| {
+        if (terminalIndexForTab(id) != null) return activateTab(model, id, fx);
+    }
 }
 
 const PaneRect = struct {
@@ -1904,7 +1937,7 @@ fn completeTabDrop(model: *Model, event: TabDragMessage, fx: *Effects) void {
     setPaneActive(layout, destination, @intCast(id));
     layout.active_pane = destination;
     collapseEmptyPane(layout, source);
-    if (id == 9 or id == 10) ensureTerminal(model, @intCast(id - 9), fx);
+    if (terminalIndexForTab(id)) |terminal_index| ensureTerminal(model, terminal_index, fx);
     bumpAllEditorReloads(model);
     syncUrls(model);
 }
@@ -1934,11 +1967,35 @@ fn explorerDropPoint(model: *const Model, message: DropFileMessage) ?TabDragMess
 }
 
 fn paneTerminalIndex(layout: *const LayoutState, pane: Pane) ?u8 {
-    return switch (layout.pane_active_tabs[paneIndex(pane)]) {
-        9 => 0,
-        10 => 1,
-        else => null,
-    };
+    return terminalIndexForTab(layout.pane_active_tabs[paneIndex(pane)]);
+}
+
+/// The terminal a pane currently SHOWS, or null when its active tab is a file.
+/// One `<terminal>` element per pane renders whichever session this names - the
+/// widget is a view onto a pty-keyed session, so re-binding the key swaps the
+/// rendered terminal without the element carrying any per-session state.
+fn paneTerminal(model: *const Model, pane: Pane) ?u8 {
+    const layout = model.activeLayoutConst() orelse return null;
+    return paneTerminalIndex(layout, pane);
+}
+
+fn paneTerminalKey(model: *const Model, pane: Pane) u64 {
+    const index = paneTerminal(model, pane) orelse return 0;
+    return terminalKey(model.active_project_id, index);
+}
+
+fn paneTerminalScrollback(model: *const Model, pane: Pane) u32 {
+    const layout = model.activeLayoutConst() orelse return 0;
+    const index = paneTerminalIndex(layout, pane) orelse return 0;
+    return layout.term_scrollback[index];
+}
+
+/// A pane's `on-terminal` reports for whichever terminal that pane was showing
+/// when the layout was built, so the scrollback lands on the active one.
+fn applyTerminalState(model: *Model, pane: Pane, state: canvas.TerminalState) void {
+    const layout = model.activeLayout() orelse return;
+    const index = paneTerminalIndex(layout, pane) orelse return;
+    layout.term_scrollback[index] = state.scrollback;
 }
 
 fn needsShellQuoting(path: []const u8) bool {
@@ -2142,7 +2199,7 @@ fn fullPath(project: *const ProjectState, relative: []const u8, output: []u8) ![
 
 fn fullPathForTab(model: *Model, id: u32) []const u8 {
     const project = model.activeProject() orelse return "";
-    if (id == 9 or id == 10) return project.path();
+    if (terminalIndexForTab(id) != null) return project.path();
     const layout = &project.layout;
     if (id < 1 or id > max_file_tabs or !layout.file_tabs[id - 1].used) return project.path();
     const value = fullPath(project, layout.file_tabs[id - 1].path(), &model.path_scratch) catch return project.path();
@@ -2153,7 +2210,7 @@ fn fullPathForTab(model: *Model, id: u32) []const u8 {
 fn relativePathForTab(model: *const Model, id: u32) []const u8 {
     const project = model.activeProjectConst() orelse return "";
     const layout = &project.layout;
-    if (id == 9 or id == 10) return ".";
+    if (terminalIndexForTab(id) != null) return ".";
     if (id < 1 or id > max_file_tabs or !layout.file_tabs[id - 1].used) return "";
     const path = layout.file_tabs[id - 1].path();
     return if (project.kind == .external_files) std.fs.path.basename(path) else path;
@@ -2190,9 +2247,9 @@ fn shellArgv(project: *const ProjectState, storage: *[5][]const u8) []const []co
 
 fn ensureTerminal(model: *Model, terminal_index: u8, fx: *Effects) void {
     const project = model.activeProject() orelse return;
-    const started = if (terminal_index == 0) project.layout.term_one_started else project.layout.term_two_started;
-    if (started) return;
-    if (terminal_index == 0) project.layout.term_one_started = true else project.layout.term_two_started = true;
+    if (terminal_index >= max_terminals) return;
+    if (project.layout.term_started[terminal_index]) return;
+    project.layout.term_started[terminal_index] = true;
     var storage: [5][]const u8 = undefined;
     fx.ptySpawn(.{
         .key = terminalKey(model.active_project_id, terminal_index),
@@ -2205,22 +2262,16 @@ fn ensureTerminal(model: *Model, terminal_index: u8, fx: *Effects) void {
 
 fn handlePtyEvent(model: *Model, event: native_sdk.EffectPtyEvent) void {
     if (event.key == 0) return;
-    const project_index: usize = @intCast((event.key - 1) / 2);
+    const project_index: usize = @intCast((event.key - 1) / max_terminals);
     if (project_index >= model.project_count) return;
-    const terminal_index: u8 = @intCast((event.key - 1) % 2);
+    const terminal_index: u8 = @intCast((event.key - 1) % max_terminals);
     const layout = &model.projects[project_index].layout;
+    if (terminal_index >= max_terminals) return;
     switch (event.kind) {
-        .output => if (terminal_index == 0) {
-            layout.term_one_live = true;
-        } else {
-            layout.term_two_live = true;
-        },
-        .exit => if (terminal_index == 0) {
-            layout.term_one_live = false;
-            layout.term_one_started = false;
-        } else {
-            layout.term_two_live = false;
-            layout.term_two_started = false;
+        .output => layout.term_live[terminal_index] = true,
+        .exit => {
+            layout.term_live[terminal_index] = false;
+            layout.term_started[terminal_index] = false;
         },
         .write => unreachable,
     }
@@ -2233,12 +2284,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .image_loaded => |result| if (result.id == model.preview_image_request and result.outcome == .loaded) {
             model.preview_image = result.id;
         },
-        .term_one_state => |state| if (model.activeLayout()) |layout| {
-            layout.term_one_scrollback = state.scrollback;
-        },
-        .term_two_state => |state| if (model.activeLayout()) |layout| {
-            layout.term_two_scrollback = state.scrollback;
-        },
+        .primary_term_state => |state| applyTerminalState(model, .primary, state),
+        .secondary_term_state => |state| applyTerminalState(model, .secondary, state),
+        .tertiary_term_state => |state| applyTerminalState(model, .tertiary, state),
+        .quaternary_term_state => |state| applyTerminalState(model, .quaternary, state),
         .project_sidebar_resized => |fraction| {
             model.project_sidebar_fraction = std.math.clamp(fraction, 0.11, 0.28);
         },
@@ -2266,7 +2315,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .activate_tab => |id| activateTab(model, id, fx),
         .drag_tab => |event| handleTabDrag(model, event, fx),
         .drag_project => |event| handleProjectDrag(model, event),
-        .close_tab => |id| requestCloseTab(model, id),
+        .close_tab => |id| requestCloseTab(model, id, fx),
         .close_other_tabs => |id| requestCloseOtherTabs(model, id, fx),
         .close_all_tabs => |id| requestCloseAllTabs(model, id, fx),
         .save_and_close_tab => if (model.close_confirmation_open) {
@@ -2402,7 +2451,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_system_file => |message| openSystemFile(model, message, fx),
         .drop_file => |message| dropFile(model, message, fx),
         .path_moved => |message| applyPathMove(model, message),
-        .path_deleted => |message| applyPathDelete(model, message),
+        .path_deleted => |message| applyPathDelete(model, message, fx),
         .copy_text => |text| copyTextToClipboard(model, text, fx),
         .markdown_saved => |message| {
             if (message.project_id == model.active_project_id) {
@@ -2557,8 +2606,11 @@ test "Other Open Files tree keeps directly opened files after tabs close" {
     try std.testing.expectEqualStrings("shared.txt", model.external_files[0].treeName());
     try std.testing.expectEqualStrings("shared.txt (2)", model.external_files[1].treeName());
 
-    closeTabNow(&model, 1);
-    closeTabNow(&model, 2);
+    var close_fx = Effects.init(std.testing.allocator);
+    defer close_fx.deinit();
+    close_fx.executor = .fake;
+    closeTabNow(&model, 1, &close_fx);
+    closeTabNow(&model, 2, &close_fx);
     try std.testing.expectEqual(@as(u8, 0), paneCount(&external.layout, .primary));
 
     var output: [4096]u8 = undefined;
@@ -3395,7 +3447,7 @@ test "a file dropped into a terminal is typed as a quoted path" {
     try std.testing.expectEqualStrings("/tmp/project/two.zig ", fx.ptyWrittenBytes(terminalKey(1, 0)));
 }
 
-test "a pane opens a second terminal beside the first" {
+test "the pane terminal button always opens a new terminal" {
     var model: Model = .{};
     model.active_project_id = addProject(&model, "/tmp/project").?;
     syncUrls(&model);
@@ -3408,25 +3460,33 @@ test "a pane opens a second terminal beside the first" {
     try std.testing.expectEqual(@as(u8, 9), layout.pane_active_tabs[paneIndex(.primary)]);
     try std.testing.expectEqual(@as(u8, 1), paneCount(layout, .primary));
 
-    // The pane already holds a terminal, so this opens the SECOND one next to
-    // it rather than re-focusing the first.
-    openTerminalIn(&model, 1, &fx);
-    try std.testing.expectEqual(@as(u8, 10), layout.pane_active_tabs[paneIndex(.primary)]);
-    try std.testing.expectEqual(@as(u8, 2), paneCount(layout, .primary));
-    try std.testing.expectEqual(Pane.primary, paneForTab(layout, 9).?);
-    try std.testing.expectEqual(Pane.primary, paneForTab(layout, 10).?);
+    // Every further click stacks another terminal in the same pane.
+    for (2..max_terminals + 1) |expected| {
+        openTerminalIn(&model, 1, &fx);
+        try std.testing.expectEqual(@as(u8, @intCast(expected)), paneCount(layout, .primary));
+        try std.testing.expectEqual(tabIdForTerminal(@intCast(expected - 1)), layout.pane_active_tabs[paneIndex(.primary)]);
+    }
 
-    // Both terminals exist and both live here, so a third click re-focuses one
-    // the pane already holds instead of opening a third tab.
-    openTerminalIn(&model, 1, &fx);
-    try std.testing.expectEqual(@as(u8, 2), paneCount(layout, .primary));
+    // Each terminal owns its own pty, and every index is spent.
+    for (0..max_terminals) |index| {
+        try std.testing.expect(layout.term_started[index]);
+        try std.testing.expectEqual(Pane.primary, paneForTab(layout, tabIdForTerminal(@intCast(index))).?);
+    }
 
-    // Each terminal owns its own pty.
-    try std.testing.expect(layout.term_one_started);
-    try std.testing.expect(layout.term_two_started);
+    // With every index spent the button focuses one the pane holds rather than
+    // opening a tab that cannot exist.
+    openTerminalIn(&model, 1, &fx);
+    try std.testing.expectEqual(@as(u8, max_terminals), paneCount(layout, .primary));
+
+    // Closing a terminal frees its index for the next click.
+    closeTabNow(&model, tabIdForTerminal(3), &fx);
+    try std.testing.expect(!layout.term_started[3]);
+    openTerminalIn(&model, 1, &fx);
+    try std.testing.expectEqual(tabIdForTerminal(3), layout.pane_active_tabs[paneIndex(.primary)]);
+    try std.testing.expect(layout.term_started[3]);
 }
 
-test "a pane with no terminal adopts the second one from another pane" {
+test "each pane's terminal button opens a terminal of its own" {
     var model: Model = .{};
     model.active_project_id = addProject(&model, "/tmp/project").?;
     syncUrls(&model);
@@ -3435,16 +3495,21 @@ test "a pane with no terminal adopts the second one from another pane" {
     fx.executor = .fake;
     const layout = model.activeLayout().?;
 
-    // Both terminals stacked in the primary pane.
     openTerminalIn(&model, 1, &fx);
     openTerminalIn(&model, 1, &fx);
     layout.secondary_panel_open = true;
 
-    // The secondary pane holds neither, so it takes the second terminal.
+    // A pane that holds none opens a fresh terminal rather than taking one of
+    // the primary pane's.
     openTerminalIn(&model, 2, &fx);
-    try std.testing.expectEqual(Pane.secondary, paneForTab(layout, 10).?);
-    try std.testing.expectEqual(Pane.primary, paneForTab(layout, 9).?);
-    try std.testing.expectEqual(@as(u8, 10), layout.pane_active_tabs[paneIndex(.secondary)]);
+    try std.testing.expectEqual(Pane.primary, paneForTab(layout, tabIdForTerminal(0)).?);
+    try std.testing.expectEqual(Pane.primary, paneForTab(layout, tabIdForTerminal(1)).?);
+    try std.testing.expectEqual(Pane.secondary, paneForTab(layout, tabIdForTerminal(2)).?);
+    try std.testing.expectEqual(tabIdForTerminal(2), layout.pane_active_tabs[paneIndex(.secondary)]);
+
+    // The pane renders whichever terminal it has active.
+    try std.testing.expectEqual(terminalKey(1, 1), paneTerminalKey(&model, .primary));
+    try std.testing.expectEqual(terminalKey(1, 2), paneTerminalKey(&model, .secondary));
 }
 
 test "a drop released back over the sidebar or explorer changes nothing" {
