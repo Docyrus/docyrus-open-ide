@@ -14,7 +14,8 @@
     "prebuild": "npm run patch:native-sdk && npm run bundle:tree",
     "build": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" native build",
     "pretest": "npm run patch:native-sdk",
-    "test": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" native test"
+    "test": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" native test && npm run test:terminal",
+    "test:terminal": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" zig build test-terminal"
   },
   "dependencies": {
     "@native-sdk/core": "0.10.1",
