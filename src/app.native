@@ -33,7 +33,7 @@
         <if test="{dirty}"><icon name="circle-dot" width="7" height="7" foreground="info" label="Unsaved changes" /></if>
         <button width="18" height="18" size="sm" variant="ghost" radius="sm" icon="x" on-press="close_tab:{tab_id}" label="Close {title}"></button>
       </row>
-      <row height="2" background="accent" />
+      <row height="2" background="info" />
     </column>
     <context-menu>
       <menu-item on-press="close_tab:{tab_id}">Close</menu-item>
