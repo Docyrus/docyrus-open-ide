@@ -50,6 +50,14 @@ const search_max_line_bytes: usize = 240;
 const search_max_matches_per_file: usize = 200;
 const clipboard_effect_key_start: u64 = 100;
 
+// Workspace restore. The session file records which projects are open, the tabs
+// each pane holds, and how the splits are sized, so a relaunch reopens the
+// workspace the user left. It is written from the event loop, so writes are
+// throttled: dragging a divider would otherwise ask for one write per frame.
+const session_version: u32 = 1;
+const session_write_capacity: usize = 256 * 1024;
+const session_save_interval_ns: i96 = 750 * std.time.ns_per_ms;
+
 pub const window_width: f32 = 1440;
 pub const window_height: f32 = 920;
 const workspace_chrome_height: f32 = 43;
@@ -968,7 +976,13 @@ pub const Msg = union(enum) {
 const DocyrusApp = native_sdk.UiAppWithFeatures(Model, Msg, .{ .runtime_markup = false });
 pub const Effects = DocyrusApp.Effects;
 
-pub fn boot(_: *Model, _: *Effects) void {}
+// A restored tab carries none of the side effects that opened it: the terminal
+// it names has no shell and the image it names has no decoded bitmap, because
+// neither went through `activateTab`. Boot is the first point with an effects
+// channel, so the visible panes catch up here.
+pub fn boot(model: *Model, fx: *Effects) void {
+    ensureActiveSurfaces(model, fx);
+}
 
 fn projectName(path: []const u8) []const u8 {
     if (path.len == 0) return "Project";
@@ -1421,6 +1435,17 @@ fn handleProjectDrag(model: *Model, event: ProjectDragMessage) void {
         },
         2 => model.project_drag_active = false,
         else => {},
+    }
+}
+
+/// A project's name lives in two places: the open project and the recents entry
+/// that remembers it after the project closes.
+fn renameProject(model: *Model, project_id: u32, name: []const u8) void {
+    if (project_id == 0 or project_id > model.project_count) return;
+    const project = &model.projects[project_id - 1];
+    project.setDisplayName(name);
+    for (model.recent_projects[0..model.recent_count]) |*recent| {
+        if (std.mem.eql(u8, recent.path(), project.path())) recent.setDisplayName(name);
     }
 }
 
@@ -2260,6 +2285,24 @@ fn ensureTerminal(model: *Model, terminal_index: u8, fx: *Effects) void {
     });
 }
 
+/// Start whatever the panes are showing but have never run: the shell behind an
+/// active terminal tab, the bitmap behind an active image tab. A restored
+/// workspace and a project switch both land in a layout whose tabs were never
+/// activated. Idempotent -- a live terminal and a loaded image are left alone.
+fn ensureActiveSurfaces(model: *Model, fx: *Effects) void {
+    const layout = model.activeLayoutConst() orelse return;
+    inline for (std.meta.tags(Pane)) |pane| {
+        if (terminalIndexForTab(layout.pane_active_tabs[paneIndex(pane)])) |terminal_index| {
+            ensureTerminal(model, terminal_index, fx);
+        }
+    }
+    const id = layout.pane_active_tabs[paneIndex(layout.active_pane)];
+    if (id < 1 or id > max_file_tabs or layout.file_tabs[id - 1].kind != .image) return;
+    const path = fullPathForTab(model, id);
+    if (model.preview_image != 0 and std.mem.eql(u8, model.preview_image_path[0..model.preview_image_path_len], path)) return;
+    ensureImage(model, id, fx);
+}
+
 fn handlePtyEvent(model: *Model, event: native_sdk.EffectPtyEvent) void {
     if (event.key == 0) return;
     const project_index: usize = @intCast((event.key - 1) / max_terminals);
@@ -2367,11 +2410,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .confirm_rename_project => {
             if (model.rename_project_open and model.rename_project_id > 0 and model.rename_project_id <= model.project_count) {
                 const name = std.mem.trim(u8, model.rename_project_buffer.text(), " \t\r\n");
-                const project = &model.projects[model.rename_project_id - 1];
-                project.setDisplayName(name);
-                for (model.recent_projects[0..model.recent_count]) |*recent| {
-                    if (std.mem.eql(u8, recent.path(), project.path())) recent.setDisplayName(name);
-                }
+                renameProject(model, model.rename_project_id, name);
             }
             model.rename_project_open = false;
             model.rename_project_id = 0;
@@ -2479,7 +2518,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .editor_discarded => completePendingClose(model, fx),
         .refresh_files => model.tree_reload_token +%= 1,
-        .finish_project_switch => model.project_switching = false,
+        .finish_project_switch => {
+            model.project_switching = false;
+            ensureActiveSurfaces(model, fx);
+        },
     }
 }
 
@@ -3553,6 +3595,161 @@ test "search trims a long line to a window around the match" {
     try std.testing.expectEqualStrings(" beta", short.after);
 }
 
+// A Model is a few megabytes of fixed-size buffers, so a restore test that
+// wants a before and an after keeps both off the stack.
+fn testModel() !*Model {
+    const model = try std.testing.allocator.create(Model);
+    model.* = .{};
+    return model;
+}
+
+fn roundTripSession(model: *const Model, restored: *Model) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const buffer = try std.testing.allocator.alloc(u8, session_write_capacity);
+    defer std.testing.allocator.free(buffer);
+    applySessionJson(restored, std.testing.io, try writeSessionJson(model, arena.allocator(), buffer));
+}
+
+test "a saved session reopens its projects, tabs, and layout" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "src");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/main.zig", .data = "pub fn main() void {}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "README.md", .data = "# Saved" });
+    var root_storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_storage);
+    const root = root_storage[0..root_len];
+
+    const model = try testModel();
+    defer std.testing.allocator.destroy(model);
+    model.active_project_id = addProject(model, root).?;
+    syncUrls(model);
+    var fx: Effects = undefined;
+    openFile(model, .{ .project_id = 1, .path = "src/main.zig" }, &fx);
+    openFileInPane(model, .{ .project_id = 1, .path = "README.md", .markdown = "# Saved" }, .secondary, &fx);
+    const layout = model.activeLayout().?;
+    layout.explorer_open = false;
+    layout.split_mode = .horizontal;
+    layout.split_fraction = 0.42;
+    renameProject(model, 1, "Renamed");
+
+    const restored = try testModel();
+    defer std.testing.allocator.destroy(restored);
+    try roundTripSession(model, restored);
+
+    try std.testing.expectEqual(@as(u8, 1), restored.project_count);
+    try std.testing.expectEqual(@as(u32, 1), restored.active_project_id);
+    try std.testing.expectEqualStrings(root, restored.projects[0].path());
+    try std.testing.expectEqualStrings("Renamed", restored.projects[0].displayName());
+    const restored_layout = &restored.projects[0].layout;
+    try std.testing.expect(!restored_layout.explorer_open);
+    try std.testing.expectEqual(SplitMode.horizontal, restored_layout.split_mode);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.42), restored_layout.split_fraction, 0.0001);
+    try std.testing.expectEqual(@as(u8, 1), paneCount(restored_layout, .primary));
+    try std.testing.expectEqual(@as(u8, 1), paneCount(restored_layout, .secondary));
+    // The panel flag is derived from where the tabs landed, never read back.
+    try std.testing.expect(restored_layout.secondary_panel_open);
+    try std.testing.expectEqualStrings("src/main.zig", restored_layout.file_tabs[0].path());
+    try std.testing.expectEqualStrings("README.md", restored_layout.file_tabs[1].path());
+    // A Markdown tab restores its reading surface from the file on disk.
+    try std.testing.expectEqualStrings("# Saved", restored_layout.file_tabs[1].markdown());
+    try std.testing.expectEqual(@as(u8, 2), paneActive(restored, .secondary));
+}
+
+test "a restored session drops files and folders that disappeared" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.txt", .data = "keep" });
+    var root_storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_storage);
+    const root = root_storage[0..root_len];
+
+    const text = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"version":1,"active_project":2,"projects":[
+        \\{{"kind":"folder","path":"{s}","layout":{{"tabs":[
+        \\{{"path":"keep.txt","pane":1,"active":true}},
+        \\{{"path":"gone.txt","pane":2,"active":true}}]}}}},
+        \\{{"kind":"folder","path":"{s}/moved-away","layout":{{"tabs":[]}}}}]}}
+    , .{ root, root });
+    defer std.testing.allocator.free(text);
+
+    const restored = try testModel();
+    defer std.testing.allocator.destroy(restored);
+    applySessionJson(restored, io, text);
+
+    // The folder that moved away takes its entry with it, and the active
+    // project falls back to the one that did come back.
+    try std.testing.expectEqual(@as(u8, 1), restored.project_count);
+    try std.testing.expectEqual(@as(u32, 1), restored.active_project_id);
+    const layout = &restored.projects[0].layout;
+    try std.testing.expectEqual(@as(u8, 1), paneCount(layout, .primary));
+    try std.testing.expectEqualStrings("keep.txt", layout.file_tabs[0].path());
+    // The deleted file leaves no empty split behind.
+    try std.testing.expectEqual(@as(u8, 0), paneCount(layout, .secondary));
+    try std.testing.expect(!layout.secondary_panel_open);
+}
+
+test "a restored session reopens terminal tabs without their shells" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_storage);
+    const root = root_storage[0..root_len];
+
+    const model = try testModel();
+    defer std.testing.allocator.destroy(model);
+    model.active_project_id = addProject(model, root).?;
+    syncUrls(model);
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    openTerminalIn(model, 1, &fx);
+    openTerminalIn(model, 2, &fx);
+    try std.testing.expect(model.projects[0].layout.term_started[0]);
+
+    const restored = try testModel();
+    defer std.testing.allocator.destroy(restored);
+    try roundTripSession(model, restored);
+
+    const layout = &restored.projects[0].layout;
+    try std.testing.expectEqual(Pane.primary, paneForTab(layout, tabIdForTerminal(0)).?);
+    try std.testing.expectEqual(Pane.secondary, paneForTab(layout, tabIdForTerminal(1)).?);
+    // A terminal comes back as a tab, not as a running shell: `boot` spawns the
+    // pty once the effects channel exists.
+    try std.testing.expect(!layout.term_started[0]);
+    try std.testing.expect(!layout.term_started[1]);
+
+    var boot_fx = Effects.init(std.testing.allocator);
+    defer boot_fx.deinit();
+    boot_fx.executor = .fake;
+    boot(restored, &boot_fx);
+    try std.testing.expect(layout.term_started[0]);
+    try std.testing.expect(layout.term_started[1]);
+}
+
+test "the session signature tracks the workspace and nothing else" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/session-project").?;
+    const opening = sessionSignature(&model);
+    try std.testing.expectEqual(opening, sessionSignature(&model));
+
+    var fx: Effects = undefined;
+    openFile(&model, .{ .project_id = 1, .path = "one.zig" }, &fx);
+    const with_tab = sessionSignature(&model);
+    try std.testing.expect(with_tab != opening);
+
+    // A repaint-only field the session never records must not ask for a write.
+    model.hovered_project_id = 1;
+    model.project_menu_open = true;
+    try std.testing.expectEqual(with_tab, sessionSignature(&model));
+
+    if (model.activeLayout()) |layout| layout.split_fraction = 0.31;
+    try std.testing.expect(sessionSignature(&model) != with_tab);
+}
+
 const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
     native_sdk.security.permission_view,
@@ -3726,6 +3923,13 @@ const AppHost = struct {
     preferences_path_len: usize = 0,
     pending_open_files: [max_pending_open_files]ExternalFile = [_]ExternalFile{.{}} ** max_pending_open_files,
     pending_open_file_count: u8 = 0,
+    session_path: [1024]u8 = undefined,
+    session_path_len: usize = 0,
+    // Zero until the first write, so a launch always makes the files on disk
+    // agree with the workspace that actually came back.
+    preferences_signature: u64 = 0,
+    session_signature: u64 = 0,
+    persisted_at_ns: i96 = 0,
 
     fn queueOpenFile(self: *AppHost, path: []const u8) void {
         if (!std.fs.path.isAbsolute(path) or path.len > project_path_capacity or self.pending_open_file_count >= max_pending_open_files) return;
@@ -3773,6 +3977,7 @@ const AppHost = struct {
         }
         if (self.ui.model.directory_picker_requested) try self.showDirectoryPicker(runtime);
         if (self.ui.model.project_switching) try self.ui.dispatch(runtime, 1, .finish_project_switch);
+        self.persistState(false);
     }
 
     fn dispatchSystemOpen(self: *AppHost, runtime: *native_sdk.Runtime, window_id: u64, path: []const u8) !void {
@@ -3793,7 +3998,7 @@ const AppHost = struct {
 
     fn stopFn(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const self: *AppHost = @ptrCast(@alignCast(context));
-        self.savePreferences();
+        self.persistState(true);
         self.runtime = null;
         try self.base.stop(runtime);
     }
@@ -3823,16 +4028,54 @@ const AppHost = struct {
         try self.ui.dispatch(runtime, 1, .{ .directory_selected = result.paths[0..end] });
     }
 
-    fn savePreferences(self: *AppHost) void {
-        if (self.preferences_path_len == 0) return;
+    /// The workspace on disk should track the workspace on screen without the
+    /// user ever saving it. Both files are written from the event loop, so a
+    /// throttle keeps a divider drag from asking for a write per mouse move,
+    /// and `force` flushes whatever is still pending as the app stops. A failed
+    /// write leaves its signature alone so the next event tries again.
+    fn persistState(self: *AppHost, force: bool) void {
+        const preferences = preferencesSignature(&self.ui.model);
+        const session = sessionSignature(&self.ui.model);
+        if (preferences == self.preferences_signature and session == self.session_signature) return;
+        const now = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+        if (!force and now - self.persisted_at_ns < session_save_interval_ns) return;
+        self.persisted_at_ns = now;
+        if (preferences != self.preferences_signature and self.savePreferences()) self.preferences_signature = preferences;
+        if (session != self.session_signature and self.saveSession()) self.session_signature = session;
+    }
+
+    fn savePreferences(self: *AppHost) bool {
+        if (self.preferences_path_len == 0) return false;
         var buffer: [12 * 1024]u8 = undefined;
         var writer: std.Io.Writer = .fixed(&buffer);
-        writer.print("theme={s}\n", .{themeName(self.ui.model.theme_mode)}) catch return;
-        writer.print("sidebar={d}\n", .{self.ui.model.project_sidebar_fraction}) catch return;
+        writer.print("theme={s}\n", .{themeName(self.ui.model.theme_mode)}) catch return false;
+        writer.print("sidebar={d}\n", .{self.ui.model.project_sidebar_fraction}) catch return false;
         for (self.ui.model.recent_projects[0..self.ui.model.recent_count]) |*recent| {
-            writer.print("recent={s}\t{s}\n", .{ recent.path(), recent.name_buffer[0..recent.name_len] }) catch return;
+            writer.print("recent={s}\t{s}\n", .{ recent.path(), recent.name_buffer[0..recent.name_len] }) catch return false;
         }
-        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.preferences_path[0..self.preferences_path_len], .data = writer.buffered() }) catch {};
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = self.preferences_path[0..self.preferences_path_len], .data = writer.buffered() }) catch return false;
+        return true;
+    }
+
+    /// Written through a sibling temporary and renamed into place. This file is
+    /// rewritten every few seconds, and a half-written one would cost the user
+    /// the workspace it exists to protect.
+    fn saveSession(self: *AppHost) bool {
+        if (self.session_path_len == 0) return false;
+        const path = self.session_path[0..self.session_path_len];
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const buffer = std.heap.page_allocator.alloc(u8, session_write_capacity) catch return false;
+        defer std.heap.page_allocator.free(buffer);
+        const text = writeSessionJson(&self.ui.model, arena.allocator(), buffer) catch return false;
+        var temporary_buffer: [1032]u8 = undefined;
+        const temporary = std.fmt.bufPrint(&temporary_buffer, "{s}.tmp", .{path}) catch return false;
+        std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = temporary, .data = text }) catch return false;
+        std.Io.Dir.renameAbsolute(temporary, path, self.io) catch {
+            std.Io.Dir.cwd().deleteFile(self.io, temporary) catch {};
+            return false;
+        };
+        return true;
     }
 
     fn validateBridgeProject(self: *AppHost, project_id: u32) !*ProjectState {
@@ -4642,6 +4885,310 @@ fn writeSearchJson(io: std.Io, project_path: []const u8, request: BridgeSearchRe
     return writer.buffered();
 }
 
+// The on-disk shape of a restored workspace. These field names ARE the file
+// format: renaming one is a format change and `session_version` moves with it.
+// Unknown fields are ignored on read, so a file written by a newer build still
+// restores the parts an older one understands.
+const SessionTab = struct {
+    // A terminal tab names its terminal index. A file tab names its path,
+    // relative to the project root for a folder project and absolute for the
+    // "Other Open Files" project, matching how an open tab stores it.
+    terminal: ?u8 = null,
+    path: []const u8 = "",
+    pane: u8 = 1,
+    active: bool = false,
+    markdown_editor: bool = false,
+    markdown_preview: bool = true,
+};
+
+// The panel-open flags (`secondary_panel_open`, `primary_child_open`,
+// `secondary_child_open`) are deliberately absent: restoring the tabs raises
+// exactly the ones the tabs need, so a pane whose files all disappeared cannot
+// come back as an empty split.
+const SessionLayout = struct {
+    explorer_open: bool = true,
+    explorer_fraction: f32 = 0.215,
+    split_fraction: f32 = 0.58,
+    split_mode: SplitMode = .vertical,
+    markdown_fraction: f32 = 0.56,
+    primary_child_fraction: f32 = 0.5,
+    primary_child_mode: SplitMode = .vertical,
+    secondary_child_fraction: f32 = 0.5,
+    secondary_child_mode: SplitMode = .vertical,
+    active_pane: u8 = 1,
+    tabs: []const SessionTab = &.{},
+};
+
+const SessionProject = struct {
+    kind: ProjectKind = .folder,
+    path: []const u8 = "",
+    name: []const u8 = "",
+    // Only the "Other Open Files" project carries these: the absolute files its
+    // tree lists, which outlive the tabs that opened them.
+    files: []const []const u8 = &.{},
+    layout: SessionLayout = .{},
+};
+
+const SessionFile = struct {
+    version: u32 = session_version,
+    // A 1-based position in `projects`, not a project id: ids are handed out
+    // again on restore.
+    active_project: u32 = 0,
+    projects: []const SessionProject = &.{},
+};
+
+fn sessionLayout(layout: *const LayoutState, arena: std.mem.Allocator) !SessionLayout {
+    var total: usize = 0;
+    for (layout.pane_tab_counts) |count| total += count;
+    const tabs = try arena.alloc(SessionTab, total);
+    var written: usize = 0;
+    inline for (std.meta.tags(Pane)) |pane| {
+        const active = layout.pane_active_tabs[paneIndex(pane)];
+        for (paneOrder(layout, pane)) |id| {
+            if (terminalIndexForTab(id)) |terminal_index| {
+                tabs[written] = .{
+                    .terminal = terminal_index,
+                    .pane = @intFromEnum(pane),
+                    .active = active == id,
+                };
+                written += 1;
+                continue;
+            }
+            if (id < 1 or id > max_file_tabs) continue;
+            const tab = &layout.file_tabs[id - 1];
+            if (!tab.used) continue;
+            tabs[written] = .{
+                .path = tab.path(),
+                .pane = @intFromEnum(pane),
+                .active = active == id,
+                .markdown_editor = tab.markdown_editor_visible,
+                .markdown_preview = tab.markdown_preview_visible,
+            };
+            written += 1;
+        }
+    }
+    return .{
+        .explorer_open = layout.explorer_open,
+        .explorer_fraction = layout.explorer_fraction,
+        .split_fraction = layout.split_fraction,
+        .split_mode = layout.split_mode,
+        .markdown_fraction = layout.markdown_fraction,
+        .primary_child_fraction = layout.primary_child_fraction,
+        .primary_child_mode = layout.primary_child_mode,
+        .secondary_child_fraction = layout.secondary_child_fraction,
+        .secondary_child_mode = layout.secondary_child_mode,
+        .active_pane = @intFromEnum(layout.active_pane),
+        .tabs = tabs[0..written],
+    };
+}
+
+fn sessionFile(model: *const Model, arena: std.mem.Allocator) !SessionFile {
+    const count: usize = model.project_count;
+    const projects = try arena.alloc(SessionProject, count);
+    var active_project: u32 = 0;
+    for (model.project_order[0..count], 0..) |project_id, index| {
+        const project = &model.projects[project_id - 1];
+        if (project_id == model.active_project_id) active_project = @intCast(index + 1);
+        var files: [][]const u8 = &.{};
+        if (project.kind == .external_files) {
+            files = try arena.alloc([]const u8, model.external_file_count);
+            for (model.external_files[0..model.external_file_count], 0..) |*file, file_index| {
+                files[file_index] = file.path();
+            }
+        }
+        projects[index] = .{
+            .kind = project.kind,
+            .path = project.path(),
+            .name = project.name_buffer[0..project.name_len],
+            .files = files,
+            .layout = try sessionLayout(&project.layout, arena),
+        };
+    }
+    return .{ .active_project = active_project, .projects = projects };
+}
+
+fn writeSessionJson(model: *const Model, arena: std.mem.Allocator, output: []u8) ![]const u8 {
+    var writer: std.Io.Writer = .fixed(output);
+    try std.json.Stringify.value(try sessionFile(model, arena), .{ .whitespace = .indent_2 }, &writer);
+    return writer.buffered();
+}
+
+// A hand-edited or truncated file must not resize a pane to nothing, and NaN
+// survives std.math.clamp.
+fn restoredFraction(value: f32, fallback: f32) f32 {
+    if (!std.math.isFinite(value)) return fallback;
+    return std.math.clamp(value, 0.05, 0.95);
+}
+
+fn directoryExists(io: std.Io, path: []const u8) bool {
+    const info = std.Io.Dir.cwd().statFile(io, path, .{}) catch return false;
+    return info.kind == .directory;
+}
+
+/// Reopen one recorded tab, or answer null when it can no longer be opened:
+/// the file is gone, the path is unsafe, the slot budget is spent, or the entry
+/// repeats one already restored.
+fn restoreSessionTab(model: *Model, project_id: u32, entry: SessionTab, io: std.Io) ?u8 {
+    const project = &model.projects[project_id - 1];
+    const layout = &project.layout;
+    if (entry.terminal) |terminal_index| {
+        if (terminal_index >= max_terminals) return null;
+        const id: u8 = @intCast(tabIdForTerminal(terminal_index));
+        if (paneForTab(layout, id) != null) return null;
+        return id;
+    }
+    if (project.kind == .folder) {
+        if (!isSafeRelativePath(entry.path)) return null;
+    } else if (!std.fs.path.isAbsolute(entry.path) or externalFileIndex(model, entry.path) == null) {
+        return null;
+    }
+    if (findFileSlot(layout, entry.path) != null) return null;
+    var absolute_buffer: [bridge_path_capacity]u8 = undefined;
+    const absolute = fullPath(project, entry.path, &absolute_buffer) catch return null;
+    if (!entryExists(io, absolute)) return null;
+    const slot = availableFileSlot(layout) orelse return null;
+    const tab = &layout.file_tabs[slot];
+    tab.setPath(entry.path);
+    if (tab.kind == .markdown) {
+        // The reading surface renders from the tab's own copy of the file, and
+        // nothing has read this one yet.
+        var markdown: []u8 = &.{};
+        markdown = std.Io.Dir.cwd().readFileAlloc(io, absolute, std.heap.page_allocator, .limited(markdown_capacity)) catch &.{};
+        defer if (markdown.len > 0) std.heap.page_allocator.free(markdown);
+        tab.setMarkdown(markdown);
+        tab.markdown_editor_visible = entry.markdown_editor;
+        // Neither surface showing would restore as a blank pane, so the reader
+        // is what a lost preview flag falls back to.
+        tab.markdown_preview_visible = entry.markdown_preview or !entry.markdown_editor;
+    }
+    return @intCast(slot + 1);
+}
+
+fn restoreSessionLayout(model: *Model, project_id: u32, entry: SessionLayout, io: std.Io) void {
+    const layout = &model.projects[project_id - 1].layout;
+    layout.explorer_open = entry.explorer_open;
+    layout.explorer_fraction = restoredFraction(entry.explorer_fraction, 0.215);
+    layout.split_fraction = restoredFraction(entry.split_fraction, 0.58);
+    layout.split_drag_origin = layout.split_fraction;
+    layout.split_mode = entry.split_mode;
+    layout.markdown_fraction = restoredFraction(entry.markdown_fraction, 0.56);
+    layout.primary_child_fraction = restoredFraction(entry.primary_child_fraction, 0.5);
+    layout.primary_child_drag_origin = layout.primary_child_fraction;
+    layout.primary_child_mode = entry.primary_child_mode;
+    layout.secondary_child_fraction = restoredFraction(entry.secondary_child_fraction, 0.5);
+    layout.secondary_child_drag_origin = layout.secondary_child_fraction;
+    layout.secondary_child_mode = entry.secondary_child_mode;
+    for (entry.tabs) |tab_entry| {
+        const pane = paneFromId(tab_entry.pane) orelse continue;
+        const id = restoreSessionTab(model, project_id, tab_entry, io) orelse continue;
+        insertTabRaw(layout, pane, id, paneCount(layout, pane));
+        if (tab_entry.active) setPaneActive(layout, pane, id);
+    }
+    inline for (std.meta.tags(Pane)) |pane| syncPaneActive(layout, pane);
+    const active_pane = paneFromId(entry.active_pane) orelse .primary;
+    layout.active_pane = if (paneCount(layout, active_pane) > 0) active_pane else .primary;
+}
+
+/// Reopen the workspace a previous run recorded. Anything that no longer
+/// resolves -- a project folder that moved, a file that was deleted -- is
+/// dropped rather than restored as a tab that cannot open.
+fn applySessionJson(model: *Model, io: std.Io, text: []const u8) void {
+    const parsed = std.json.parseFromSlice(SessionFile, std.heap.page_allocator, text, .{ .ignore_unknown_fields = true }) catch return;
+    defer parsed.deinit();
+    if (parsed.value.version != session_version) return;
+    var active_project_id: u32 = 0;
+    for (parsed.value.projects, 0..) |entry, index| {
+        var project_id: u32 = 0;
+        if (entry.kind == .external_files) {
+            project_id = ensureExternalProject(model) orelse continue;
+        } else {
+            if (!std.fs.path.isAbsolute(entry.path) or !directoryExists(io, entry.path)) continue;
+            project_id = addProject(model, entry.path) orelse continue;
+        }
+        if (entry.name.len > 0) renameProject(model, project_id, entry.name);
+        if (entry.kind == .external_files) {
+            for (entry.files) |path| {
+                if (!std.fs.path.isAbsolute(path) or !entryExists(io, path)) continue;
+                _ = addExternalFile(model, path);
+            }
+        }
+        restoreSessionLayout(model, project_id, entry.layout, io);
+        if (index + 1 == parsed.value.active_project) active_project_id = project_id;
+    }
+    if (model.project_count == 0) return;
+    model.active_project_id = if (active_project_id != 0) active_project_id else model.project_order[0];
+}
+
+fn loadSession(model: *Model, io: std.Io, path: []const u8) void {
+    const content = std.Io.Dir.cwd().readFileAlloc(io, path, std.heap.page_allocator, .limited(session_write_capacity)) catch return;
+    defer std.heap.page_allocator.free(content);
+    applySessionJson(model, io, content);
+}
+
+fn hashBytes(hasher: *std.hash.Wyhash, bytes: []const u8) void {
+    hasher.update(bytes);
+    // Field boundaries have to survive hashing: without a separator "ab" + "c"
+    // and "a" + "bc" would read as the same workspace.
+    hasher.update(&[_]u8{0});
+}
+
+fn hashNumber(hasher: *std.hash.Wyhash, value: u64) void {
+    hasher.update(std.mem.asBytes(&value));
+}
+
+// Hashed through their bit pattern rather than std.mem.asBytes, which would
+// also feed in whatever padding bits a bool or a small enum leaves undefined.
+fn hashFloat(hasher: *std.hash.Wyhash, value: f32) void {
+    const bits: u32 = @bitCast(value);
+    hashNumber(hasher, bits);
+}
+
+fn preferencesSignature(model: *const Model) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hashNumber(&hasher, @intFromEnum(model.theme_mode));
+    hashFloat(&hasher, model.project_sidebar_fraction);
+    for (model.recent_projects[0..model.recent_count]) |*recent| {
+        hashBytes(&hasher, recent.path());
+        hashBytes(&hasher, recent.name_buffer[0..recent.name_len]);
+    }
+    return hasher.final();
+}
+
+/// A cheap fingerprint of everything `writeSessionJson` records, so the event
+/// loop can tell a workspace that changed from one that only repainted.
+fn sessionSignature(model: *const Model) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    hashNumber(&hasher, model.active_project_id);
+    hasher.update(model.project_order[0..model.project_count]);
+    for (model.external_files[0..model.external_file_count]) |*file| hashBytes(&hasher, file.path());
+    for (model.projects[0..model.project_count]) |*project| {
+        hashNumber(&hasher, @intFromEnum(project.kind));
+        hashBytes(&hasher, project.path());
+        hashBytes(&hasher, project.name_buffer[0..project.name_len]);
+        const layout = &project.layout;
+        hashNumber(&hasher, @intFromBool(layout.explorer_open));
+        hashFloat(&hasher, layout.explorer_fraction);
+        hashFloat(&hasher, layout.split_fraction);
+        hashNumber(&hasher, @intFromEnum(layout.split_mode));
+        hashFloat(&hasher, layout.markdown_fraction);
+        hashFloat(&hasher, layout.primary_child_fraction);
+        hashNumber(&hasher, @intFromEnum(layout.primary_child_mode));
+        hashFloat(&hasher, layout.secondary_child_fraction);
+        hashNumber(&hasher, @intFromEnum(layout.secondary_child_mode));
+        hashNumber(&hasher, @intFromEnum(layout.active_pane));
+        hasher.update(&layout.pane_tab_counts);
+        hasher.update(&layout.pane_active_tabs);
+        for (&layout.pane_orders) |*order| hasher.update(order);
+        for (&layout.file_tabs) |*tab| {
+            if (!tab.used) continue;
+            hashBytes(&hasher, tab.path());
+            hashNumber(&hasher, @intFromBool(tab.markdown_editor_visible));
+            hashNumber(&hasher, @intFromBool(tab.markdown_preview_visible));
+        }
+    }
+    return hasher.final();
+}
+
 fn loadPreferences(model: *Model, io: std.Io, path: []const u8) void {
     const content = std.Io.Dir.cwd().readFileAlloc(io, path, std.heap.page_allocator, .limited(12 * 1024)) catch return;
     defer std.heap.page_allocator.free(content);
@@ -4664,7 +5211,7 @@ fn loadPreferences(model: *Model, io: std.Io, path: []const u8) void {
     }
 }
 
-fn resolvePreferencesPath(init: std.process.Init, output: []u8) ?[]const u8 {
+fn resolveAppDataFile(init: std.process.Init, name: []const u8, output: []u8) ?[]const u8 {
     var directory_buffer: [768]u8 = undefined;
     const directory = native_sdk.app_dirs.resolveOne(
         .{ .name = bundle_id },
@@ -4674,7 +5221,7 @@ fn resolvePreferencesPath(init: std.process.Init, output: []u8) ?[]const u8 {
         &directory_buffer,
     ) catch return null;
     std.Io.Dir.cwd().createDirPath(init.io, directory) catch return null;
-    return std.fmt.bufPrint(output, "{s}/preferences.txt", .{directory}) catch null;
+    return std.fmt.bufPrint(output, "{s}/{s}", .{ directory, name }) catch null;
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -4688,8 +5235,11 @@ pub fn main(init: std.process.Init) !void {
 
     if (init.environ_map.get("HOME")) |home_path| initial_model.setHomePath(home_path);
     var preferences_path: [1024]u8 = undefined;
-    const resolved_preferences = resolvePreferencesPath(init, &preferences_path);
+    const resolved_preferences = resolveAppDataFile(init, "preferences.txt", &preferences_path);
     if (resolved_preferences) |path| loadPreferences(initial_model, init.io, path);
+    var session_path: [1024]u8 = undefined;
+    const resolved_session = resolveAppDataFile(init, "session.json", &session_path);
+    if (resolved_session) |path| loadSession(initial_model, init.io, path);
     if (init.environ_map.get("DOCYRUS_OPEN_IDE_E2E_PROJECT")) |path| {
         initial_model.active_project_id = addProject(initial_model, path) orelse 0;
     }
@@ -4708,6 +5258,10 @@ pub fn main(init: std.process.Init) !void {
     if (resolved_preferences) |path| {
         host.preferences_path_len = path.len;
         @memcpy(host.preferences_path[0..path.len], path);
+    }
+    if (resolved_session) |path| {
+        host.session_path_len = path.len;
+        @memcpy(host.session_path[0..path.len], path);
     }
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len > 1) {
