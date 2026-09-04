@@ -1761,19 +1761,26 @@ fn completePendingClose(model: *Model, fx: *Effects) void {
     }
 }
 
+// A pane holds terminals like any other tab, so a pane already showing one
+// opens the second beside it rather than re-focusing the first. The workspace
+// owns exactly two terminal tabs (9 and 10, one pty each per project), so the
+// order is: spend an unopened terminal first, then fall back to focusing one
+// this pane already holds, and only then adopt a terminal parked elsewhere -
+// a click on a pane's terminal button always leaves that pane showing one.
 fn openTerminalIn(model: *Model, pane_id: u32, fx: *Effects) void {
     const layout = model.activeLayout() orelse return;
     const pane = paneFromId(pane_id) orelse return;
-    for (paneOrder(layout, pane)) |id| {
-        if (id == 9 or id == 10) {
-            layout.active_pane = pane;
-            activateTab(model, id, fx);
-            return;
-        }
-    }
-    const id: u32 = if (paneForTab(layout, 9) == null) 9 else 10;
     layout.active_pane = pane;
-    activateTab(model, id, fx);
+
+    if (paneForTab(layout, 9) == null) return activateTab(model, 9, fx);
+    if (paneForTab(layout, 10) == null) return activateTab(model, 10, fx);
+
+    for (paneOrder(layout, pane)) |id| {
+        if (id == 9 or id == 10) return activateTab(model, id, fx);
+    }
+
+    moveTabToPane(layout, 10, pane);
+    activateTab(model, 10, fx);
 }
 
 const PaneRect = struct {
@@ -3386,6 +3393,58 @@ test "a file dropped into a terminal is typed as a quoted path" {
     dropFile(&model, explorerDrop(&model, 700, 50, "two.zig", "/tmp/project/two.zig"), &fx);
     try std.testing.expectEqual(Pane.primary, paneForTab(layout, 1).?);
     try std.testing.expectEqualStrings("/tmp/project/two.zig ", fx.ptyWrittenBytes(terminalKey(1, 0)));
+}
+
+test "a pane opens a second terminal beside the first" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    const layout = model.activeLayout().?;
+
+    openTerminalIn(&model, 1, &fx);
+    try std.testing.expectEqual(@as(u8, 9), layout.pane_active_tabs[paneIndex(.primary)]);
+    try std.testing.expectEqual(@as(u8, 1), paneCount(layout, .primary));
+
+    // The pane already holds a terminal, so this opens the SECOND one next to
+    // it rather than re-focusing the first.
+    openTerminalIn(&model, 1, &fx);
+    try std.testing.expectEqual(@as(u8, 10), layout.pane_active_tabs[paneIndex(.primary)]);
+    try std.testing.expectEqual(@as(u8, 2), paneCount(layout, .primary));
+    try std.testing.expectEqual(Pane.primary, paneForTab(layout, 9).?);
+    try std.testing.expectEqual(Pane.primary, paneForTab(layout, 10).?);
+
+    // Both terminals exist and both live here, so a third click re-focuses one
+    // the pane already holds instead of opening a third tab.
+    openTerminalIn(&model, 1, &fx);
+    try std.testing.expectEqual(@as(u8, 2), paneCount(layout, .primary));
+
+    // Each terminal owns its own pty.
+    try std.testing.expect(layout.term_one_started);
+    try std.testing.expect(layout.term_two_started);
+}
+
+test "a pane with no terminal adopts the second one from another pane" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    const layout = model.activeLayout().?;
+
+    // Both terminals stacked in the primary pane.
+    openTerminalIn(&model, 1, &fx);
+    openTerminalIn(&model, 1, &fx);
+    layout.secondary_panel_open = true;
+
+    // The secondary pane holds neither, so it takes the second terminal.
+    openTerminalIn(&model, 2, &fx);
+    try std.testing.expectEqual(Pane.secondary, paneForTab(layout, 10).?);
+    try std.testing.expectEqual(Pane.primary, paneForTab(layout, 9).?);
+    try std.testing.expectEqual(@as(u8, 10), layout.pane_active_tabs[paneIndex(.secondary)]);
 }
 
 test "a drop released back over the sidebar or explorer changes nothing" {
