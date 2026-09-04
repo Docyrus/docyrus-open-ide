@@ -4,7 +4,7 @@
   "private": true,
   "description": "A lightweight Native SDK editor with Monaco, Markdown preview, and terminal panes.",
   "scripts": {
-    "patch:native-sdk": "node scripts/patch-native-sdk-pointer.mjs && node scripts/patch-native-sdk-open-files.mjs && node scripts/patch-native-sdk-web-pane-limit.mjs && node scripts/patch-native-sdk-terminal-cells.mjs",
+    "patch:native-sdk": "node scripts/patch-native-sdk-pointer.mjs && node scripts/patch-native-sdk-open-files.mjs && node scripts/patch-native-sdk-web-pane-limit.mjs && node scripts/patch-native-sdk-terminal-cells.mjs && node scripts/patch-native-sdk-shell-relayout.mjs && node scripts/patch-native-sdk-webview-reorder.mjs",
     "postinstall": "npm run patch:native-sdk",
     "bundle:tree": "esbuild frontend/tree.js --bundle --format=iife --platform=browser --target=safari16 --outfile=frontend/dist/tree.js",
     "precheck": "npm run patch:native-sdk && npm run bundle:tree",
