@@ -1,6 +1,6 @@
 {
   "name": "docyrus-open-ide",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "description": "A lightweight Native SDK editor with Monaco, Markdown preview, and terminal panes.",
   "scripts": {
