@@ -4,7 +4,7 @@
     "name": "docyrus-open-ide",
     "display_name": "Docyrus Open IDE",
     "description": "A lightweight native workspace for code, Markdown, and terminal sessions.",
-    "version": "0.1.4",
+    "version": "0.1.5",
     "icons": ["assets/docyrus-open-ide-icon.png"],
     "platforms": ["macos"],
     "permissions": ["view", "command", "clipboard", "filesystem"],
