@@ -38,6 +38,11 @@ const bridge_tree_page_limit: usize = 160;
 // Bridge handler results are capped at 12 KiB. Leave room for the response
 // envelope and JSON metadata so a large project cannot fail as one payload.
 const bridge_tree_page_budget: usize = 9 * 1024;
+const search_max_query_bytes: usize = 256;
+const search_max_file_bytes: usize = 512 * 1024;
+const search_max_files: usize = 4096;
+const search_max_line_bytes: usize = 240;
+const search_max_matches_per_file: usize = 200;
 const clipboard_effect_key_start: u64 = 100;
 
 pub const window_width: f32 = 1440;
@@ -94,6 +99,34 @@ const OpenFileMessage = struct {
     project_id: u32,
     path: []const u8,
     markdown: []const u8 = "",
+    edit: bool = false,
+    line: u32 = 0,
+};
+
+// A file dragged out of the File Explorer WebView and released over the native
+// workspace. The explorer can only report the release point in its own
+// coordinates, so it sends its viewport size too and the workspace inverts the
+// explorer's placement to recover the window point the panes are laid out in.
+const DropFileMessage = struct {
+    project_id: u32,
+    path: []const u8,
+    absolute: []const u8,
+    markdown: []const u8 = "",
+    x: f32 = 0,
+    y: f32 = 0,
+    viewWidth: f32 = 0,
+    viewHeight: f32 = 0,
+};
+
+const PathMovedMessage = struct {
+    project_id: u32,
+    from: []const u8,
+    to: []const u8,
+};
+
+const PathDeletedMessage = struct {
+    project_id: u32,
+    path: []const u8,
 };
 
 const MarkdownSavedMessage = struct {
@@ -121,8 +154,11 @@ const FileTab = struct {
     used: bool = false,
     dirty: bool = false,
     kind: FileKind = .text,
-    markdown_editor_visible: bool = true,
+    // Markdown opens as a reading surface. The Monaco pane joins it only when
+    // the Editor toggle, an explorer "Edit" action, or a save prompt asks.
+    markdown_editor_visible: bool = false,
     markdown_preview_visible: bool = true,
+    reveal_line: u32 = 0,
     path_buffer: [project_path_capacity]u8 = undefined,
     path_len: usize = 0,
     title_buffer: [title_capacity]u8 = undefined,
@@ -155,6 +191,26 @@ const FileTab = struct {
     fn setMarkdown(self: *FileTab, value: []const u8) void {
         self.markdown_len = @min(value.len, self.markdown_buffer.len);
         @memcpy(self.markdown_buffer[0..self.markdown_len], value[0..self.markdown_len]);
+    }
+
+    // A renamed file keeps its editor: only the path, title, and kind move.
+    fn movePath(self: *FileTab, value: []const u8) void {
+        const dirty = self.dirty;
+        const was_markdown = self.kind == .markdown;
+        const editor_visible = self.markdown_editor_visible;
+        const preview_visible = self.markdown_preview_visible;
+        self.setPath(value);
+        self.dirty = dirty;
+        if (self.kind != .markdown) return;
+        if (!was_markdown) {
+            // A file that only just became Markdown has no preview body yet.
+            // Leave the reader in the editor they already had open.
+            self.markdown_editor_visible = true;
+            self.markdown_preview_visible = false;
+            return;
+        }
+        self.markdown_editor_visible = editor_visible;
+        self.markdown_preview_visible = preview_visible or !editor_visible;
     }
 };
 
@@ -816,6 +872,10 @@ pub const Msg = union(enum) {
         "directory_picker_cancelled",
         "open_file",
         "open_system_file",
+        "drop_file",
+        "path_moved",
+        "path_deleted",
+        "copy_text",
         "markdown_saved",
         "editor_dirty_changed",
         "editor_discarded",
@@ -889,6 +949,10 @@ pub const Msg = union(enum) {
     toggle_markdown_preview: u32,
     open_file: OpenFileMessage,
     open_system_file: SystemOpenFileMessage,
+    drop_file: DropFileMessage,
+    path_moved: PathMovedMessage,
+    path_deleted: PathDeletedMessage,
+    copy_text: []const u8,
     markdown_saved: MarkdownSavedMessage,
     editor_dirty_changed: EditorDirtyMessage,
     editor_discarded,
@@ -1362,19 +1426,25 @@ fn bumpAllEditorReloads(model: *Model) void {
     inline for (std.meta.tags(Pane)) |pane| bumpEditorReload(model, pane);
 }
 
+fn paneRevealLine(model: *const Model, pane: Pane) u32 {
+    const layout = model.activeLayoutConst() orelse return 0;
+    const slot = activeFileSlot(layout, pane) orelse return 0;
+    return layout.file_tabs[slot].reveal_line;
+}
+
 fn syncUrls(model: *Model) void {
     const theme = themeName(model.theme_mode);
     const primary_slot = paneActive(model, .primary);
     const secondary_slot = paneActive(model, .secondary);
     const tertiary_slot = paneActive(model, .tertiary);
     const quaternary_slot = paneActive(model, .quaternary);
-    const primary = std.fmt.bufPrint(&model.primary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}", .{ model.active_project_id, primary_slot, theme }) catch "";
+    const primary = std.fmt.bufPrint(&model.primary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}&line={d}", .{ model.active_project_id, primary_slot, theme, paneRevealLine(model, .primary) }) catch "";
     model.primary_url_len = primary.len;
-    const secondary = std.fmt.bufPrint(&model.secondary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}", .{ model.active_project_id, secondary_slot, theme }) catch "";
+    const secondary = std.fmt.bufPrint(&model.secondary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}&line={d}", .{ model.active_project_id, secondary_slot, theme, paneRevealLine(model, .secondary) }) catch "";
     model.secondary_url_len = secondary.len;
-    const tertiary = std.fmt.bufPrint(&model.tertiary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}", .{ model.active_project_id, tertiary_slot, theme }) catch "";
+    const tertiary = std.fmt.bufPrint(&model.tertiary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}&line={d}", .{ model.active_project_id, tertiary_slot, theme, paneRevealLine(model, .tertiary) }) catch "";
     model.tertiary_url_len = tertiary.len;
-    const quaternary = std.fmt.bufPrint(&model.quaternary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}", .{ model.active_project_id, quaternary_slot, theme }) catch "";
+    const quaternary = std.fmt.bufPrint(&model.quaternary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}&line={d}", .{ model.active_project_id, quaternary_slot, theme, paneRevealLine(model, .quaternary) }) catch "";
     model.quaternary_url_len = quaternary.len;
     const tree = std.fmt.bufPrint(&model.tree_url_buffer, "zero://app/tree.html?project={d}&theme={s}", .{ model.active_project_id, theme }) catch "";
     model.tree_url_len = tree.len;
@@ -1454,6 +1524,14 @@ fn activateTab(model: *Model, id: u32, fx: *Effects) void {
 }
 
 fn openFile(model: *Model, message: OpenFileMessage, fx: *Effects) void {
+    openFileInPane(model, message, null, fx);
+}
+
+// `target` names the pane the file must end up in; `null` leaves an already
+// open file where it is and puts a new one in the active pane. A file owns one
+// tab, so aiming an open file at another pane moves it there the way a tab drag
+// would rather than opening the same file twice.
+fn openFileInPane(model: *Model, message: OpenFileMessage, target: ?Pane, fx: *Effects) void {
     if (message.project_id != model.active_project_id) return;
     const project = model.activeProjectConst() orelse return;
     if (project.kind == .folder) {
@@ -1461,9 +1539,80 @@ fn openFile(model: *Model, message: OpenFileMessage, fx: *Effects) void {
     } else if (!std.fs.path.isAbsolute(message.path) or externalFileIndex(model, message.path) == null) return;
     const layout = model.activeLayout() orelse return;
     const slot = findFileSlot(layout, message.path) orelse availableFileSlot(layout) orelse return;
-    if (!layout.file_tabs[slot].used) layout.file_tabs[slot].setPath(message.path);
-    if (layout.file_tabs[slot].kind == .markdown) layout.file_tabs[slot].setMarkdown(message.markdown);
-    activateTab(model, @intCast(slot + 1), fx);
+    const tab = &layout.file_tabs[slot];
+    if (!tab.used) tab.setPath(message.path);
+    if (tab.kind == .markdown) {
+        tab.setMarkdown(message.markdown);
+        if (message.edit) tab.markdown_editor_visible = true;
+    }
+    tab.reveal_line = message.line;
+    const id: u8 = @intCast(slot + 1);
+    if (target) |pane| moveTabToPane(layout, id, pane);
+    activateTab(model, id, fx);
+}
+
+fn moveTabToPane(layout: *LayoutState, id: u8, pane: Pane) void {
+    if (paneForTab(layout, id)) |source| {
+        if (source == pane) return;
+        _ = removeTabRaw(layout, source, tabIndex(layout, source, id) orelse return);
+        syncPaneActive(layout, source);
+        insertTabRaw(layout, pane, id, paneCount(layout, pane));
+        collapseEmptyPane(layout, source);
+    } else insertTabRaw(layout, pane, id, paneCount(layout, pane));
+    setPaneActive(layout, pane, id);
+    layout.active_pane = pane;
+}
+
+// A path move touches every tab at or below the moved path, so an open editor
+// keeps writing to the file the user just renamed instead of its old location.
+fn applyPathMove(model: *Model, message: PathMovedMessage) void {
+    if (message.project_id != model.active_project_id) return;
+    const project = model.activeProjectConst() orelse return;
+    if (project.kind != .folder) return;
+    if (!isSafeRelativePath(message.from) or !isSafeRelativePath(message.to)) return;
+    const from = std.mem.trimEnd(u8, message.from, "/");
+    const to = std.mem.trimEnd(u8, message.to, "/");
+    if (from.len == 0 or to.len == 0) return;
+    const layout = model.activeLayout() orelse return;
+    for (&layout.file_tabs) |*tab| {
+        if (!tab.used) continue;
+        const path = tab.path();
+        var moved_buffer: [project_path_capacity]u8 = undefined;
+        const moved = if (std.mem.eql(u8, path, from))
+            to
+        else if (path.len > from.len and std.mem.startsWith(u8, path, from) and path[from.len] == '/')
+            std.fmt.bufPrint(&moved_buffer, "{s}{s}", .{ to, path[from.len..] }) catch continue
+        else
+            continue;
+        tab.movePath(moved);
+    }
+    syncUrls(model);
+}
+
+fn applyPathDelete(model: *Model, message: PathDeletedMessage) void {
+    if (message.project_id != model.active_project_id) return;
+    const project = model.activeProjectConst() orelse return;
+    if (project.kind != .folder) return;
+    if (!isSafeRelativePath(message.path)) return;
+    const removed = std.mem.trimEnd(u8, message.path, "/");
+    if (removed.len == 0) return;
+    const layout = model.activeLayout() orelse return;
+    for (&layout.file_tabs, 0..) |*tab, index| {
+        if (!tab.used) continue;
+        const path = tab.path();
+        const affected = std.mem.eql(u8, path, removed) or
+            (path.len > removed.len and std.mem.startsWith(u8, path, removed) and path[removed.len] == '/');
+        // The file is already gone, so the unsaved-changes prompt has nothing
+        // left to save. Drop the tab instead of asking.
+        if (affected) closeTabNow(model, @intCast(index + 1));
+    }
+}
+
+fn copyTextToClipboard(model: *Model, text: []const u8, fx: *Effects) void {
+    if (text.len == 0) return;
+    const key = model.clipboard_key;
+    model.clipboard_key +%= 1;
+    fx.writeClipboard(.{ .key = key, .text = text, .on_result = Effects.clipboardMsg(.clipboard_result) });
 }
 
 fn collapseEmptyPane(layout: *LayoutState, pane: Pane) void {
@@ -1688,6 +1837,28 @@ fn leafRect(layout: *const LayoutState, pane: Pane, workspace: PaneRect) PaneRec
         .{ .x = branch.x, .y = branch.y + first_height + horizontal_split_divider_height, .width = branch.width, .height = available - first_height };
 }
 
+// Which leaf the point lands in, reading the layout as it already stands. A tab
+// drag may first open a split and then ask this; an explorer drop never does,
+// so the split-creating half stays in `dragDestination`.
+fn paneAtPoint(layout: *const LayoutState, workspace: PaneRect, x: f32, y: f32) Pane {
+    if (!layout.secondary_panel_open) return .primary;
+    const in_primary_branch = switch (layout.split_mode) {
+        .vertical => x < workspace.x + workspace.width * layout.split_fraction,
+        .horizontal => y < rootBranchRect(layout, true, workspace).y + rootBranchRect(layout, true, workspace).height,
+    };
+    const branch = rootBranchRect(layout, in_primary_branch, workspace);
+    const child_open = if (in_primary_branch) layout.primary_child_open else layout.secondary_child_open;
+    if (!child_open) return if (in_primary_branch) .primary else .secondary;
+    const child_mode = if (in_primary_branch) layout.primary_child_mode else layout.secondary_child_mode;
+    const child_fraction = if (in_primary_branch) layout.primary_child_fraction else layout.secondary_child_fraction;
+    const in_first_child = switch (child_mode) {
+        .vertical => x < branch.x + branch.width * child_fraction,
+        .horizontal => y < branch.y + (@max(@as(f32, 1), branch.height - horizontal_split_divider_height) * child_fraction),
+    };
+    if (in_primary_branch) return if (in_first_child) .primary else .tertiary;
+    return if (in_first_child) .secondary else .quaternary;
+}
+
 fn dragDestination(model: *Model, event: TabDragMessage) Pane {
     const layout = model.activeLayout() orelse return .primary;
     const workspace = workspaceRect(model, event);
@@ -1704,21 +1875,7 @@ fn dragDestination(model: *Model, event: TabDragMessage) Pane {
         }
         return .primary;
     }
-    const in_primary_branch = switch (layout.split_mode) {
-        .vertical => event.x < workspace.x + workspace.width * layout.split_fraction,
-        .horizontal => event.y < rootBranchRect(layout, true, workspace).y + rootBranchRect(layout, true, workspace).height,
-    };
-    const branch = rootBranchRect(layout, in_primary_branch, workspace);
-    const child_open = if (in_primary_branch) layout.primary_child_open else layout.secondary_child_open;
-    if (!child_open) return if (in_primary_branch) .primary else .secondary;
-    const child_mode = if (in_primary_branch) layout.primary_child_mode else layout.secondary_child_mode;
-    const child_fraction = if (in_primary_branch) layout.primary_child_fraction else layout.secondary_child_fraction;
-    const in_first_child = switch (child_mode) {
-        .vertical => event.x < branch.x + branch.width * child_fraction,
-        .horizontal => event.y < branch.y + (@max(@as(f32, 1), branch.height - horizontal_split_divider_height) * child_fraction),
-    };
-    if (in_primary_branch) return if (in_first_child) .primary else .tertiary;
-    return if (in_first_child) .secondary else .quaternary;
+    return paneAtPoint(layout, workspace, event.x, event.y);
 }
 
 fn dragInsertionIndex(model: *const Model, pane: Pane, event: TabDragMessage) usize {
@@ -1743,6 +1900,101 @@ fn completeTabDrop(model: *Model, event: TabDragMessage, fx: *Effects) void {
     if (id == 9 or id == 10) ensureTerminal(model, @intCast(id - 9), fx);
     bumpAllEditorReloads(model);
     syncUrls(model);
+}
+
+// The explorer WebView sits to the right of the project sidebar and below both
+// the window chrome and the explorer's own header rows. Its width pins the
+// window width -- sidebar and explorer are both fractions of it -- so a point
+// the WebView reports in its own coordinates goes back into window coordinates
+// without the window ever having told the WebView how large it is.
+const explorer_chrome_height: f32 = 59;
+const pane_tab_strip_height: f32 = 25;
+
+fn explorerDropPoint(model: *const Model, message: DropFileMessage) ?TabDragMessage {
+    const layout = model.activeLayoutConst() orelse return null;
+    if (!layout.explorer_open) return null;
+    if (!(message.viewWidth > 0) or !(message.viewHeight > 0)) return null;
+    if (!(layout.explorer_fraction > 0) or !(model.project_sidebar_fraction < 1)) return null;
+    const content_width = message.viewWidth / layout.explorer_fraction;
+    const view_width = content_width / (1 - model.project_sidebar_fraction);
+    const explorer_top = workspace_chrome_height + explorer_chrome_height;
+    return .{
+        .x = (view_width - content_width) + message.x,
+        .y = explorer_top + message.y,
+        .viewWidth = view_width,
+        .viewHeight = message.viewHeight + explorer_top,
+    };
+}
+
+fn paneTerminalIndex(layout: *const LayoutState, pane: Pane) ?u8 {
+    return switch (layout.pane_active_tabs[paneIndex(pane)]) {
+        9 => 0,
+        10 => 1,
+        else => null,
+    };
+}
+
+fn needsShellQuoting(path: []const u8) bool {
+    if (path.len == 0) return true;
+    for (path) |byte| switch (byte) {
+        'A'...'Z', 'a'...'z', '0'...'9', '/', '.', '_', '-', '+', ',', ':', '=', '@', '%' => {},
+        else => return true,
+    };
+    return false;
+}
+
+// The path as one shell word, with the trailing space that lets the drop land
+// mid-command ("cat " + path). Single quotes cover every metacharacter, and the
+// only byte they cannot hold is a single quote itself.
+fn shellQuotePath(path: []const u8, output: []u8) ?[]const u8 {
+    var writer: std.Io.Writer = .fixed(output);
+    if (needsShellQuoting(path)) {
+        writer.writeByte('\'') catch return null;
+        for (path) |byte| {
+            if (byte == '\'') writer.writeAll("'\\''") catch return null else writer.writeByte(byte) catch return null;
+        }
+        writer.writeByte('\'') catch return null;
+    } else writer.writeAll(path) catch return null;
+    writer.writeByte(' ') catch return null;
+    return writer.buffered();
+}
+
+fn pasteIntoTerminal(model: *Model, terminal_index: u8, path: []const u8, fx: *Effects) void {
+    const key = terminalKey(model.active_project_id, terminal_index);
+    if (key == 0) return;
+    // The bridge hands over at most `bridge_path_capacity` bytes, and the
+    // densest quoting a path can force is four bytes per byte.
+    var buffer: [bridge_path_capacity * 4 + 8]u8 = undefined;
+    const text = shellQuotePath(path, &buffer) orelse return;
+    _ = fx.ptyWrite(key, text);
+}
+
+// A file released over the workspace from the File Explorer. The tab strip of a
+// pane always opens the file there; below it the pane's own content decides,
+// and a terminal takes the absolute path as typing instead of a new tab.
+fn dropFile(model: *Model, message: DropFileMessage, fx: *Effects) void {
+    if (message.project_id != model.active_project_id) return;
+    const point = explorerDropPoint(model, message) orelse return;
+    const workspace = workspaceRect(model, point);
+    // Released back over the sidebar, the explorer, or the title bar -- or past
+    // the window edge onto another application -- so no pane asked for this
+    // file.
+    if (point.x < workspace.x or point.y < workspace.y) return;
+    if (point.x > point.viewWidth or point.y > point.viewHeight) return;
+    const layout = model.activeLayout() orelse return;
+    const pane = paneAtPoint(layout, workspace, point.x, point.y);
+    const rect = leafRect(layout, pane, workspace);
+    if (point.y >= rect.y + pane_tab_strip_height) {
+        if (paneTerminalIndex(layout, pane)) |terminal_index| {
+            pasteIntoTerminal(model, terminal_index, message.absolute, fx);
+            return;
+        }
+    }
+    openFileInPane(model, .{
+        .project_id = message.project_id,
+        .path = message.path,
+        .markdown = message.markdown,
+    }, pane, fx);
 }
 
 fn handleTabDrag(model: *Model, event: TabDragMessage, fx: *Effects) void {
@@ -1902,10 +2154,7 @@ fn relativePathForTab(model: *const Model, id: u32) []const u8 {
 
 fn copyTabPath(model: *Model, id: u32, absolute: bool, fx: *Effects) void {
     const path = if (absolute) fullPathForTab(model, id) else relativePathForTab(model, id);
-    if (path.len == 0) return;
-    const key = model.clipboard_key;
-    model.clipboard_key +%= 1;
-    fx.writeClipboard(.{ .key = key, .text = path, .on_result = Effects.clipboardMsg(.clipboard_result) });
+    copyTextToClipboard(model, path, fx);
 }
 
 fn ensureImage(model: *Model, id: u32, fx: *Effects) void {
@@ -2144,6 +2393,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .toggle_markdown_preview => |pane_id| toggleMarkdownSurface(model, pane_id, false),
         .open_file => |message| openFile(model, message, fx),
         .open_system_file => |message| openSystemFile(model, message, fx),
+        .drop_file => |message| dropFile(model, message, fx),
+        .path_moved => |message| applyPathMove(model, message),
+        .path_deleted => |message| applyPathDelete(model, message),
+        .copy_text => |text| copyTextToClipboard(model, text, fx),
         .markdown_saved => |message| {
             if (message.project_id == model.active_project_id) {
                 const layout = model.activeLayout() orelse return;
@@ -2546,21 +2799,88 @@ test "dirty file tabs require confirmation and save before closing" {
     try std.testing.expectEqual(@as(u8, 0), paneCount(&model.projects[0].layout, .primary));
 }
 
-test "markdown editor and preview toggles always leave one surface visible" {
+test "markdown opens in preview only and toggles always leave one surface visible" {
     var model: Model = .{};
     model.active_project_id = addProject(&model, "/tmp/project").?;
     syncUrls(&model);
     var fx: Effects = undefined;
     openFile(&model, .{ .project_id = 1, .path = "README.md", .markdown = "# Test" }, &fx);
+    try std.testing.expect(!model.primary_markdown_editor_visible());
+    try std.testing.expect(model.primary_markdown_preview_visible());
+    try std.testing.expect(!model.primary_uses_editor());
+
+    // The lone visible surface refuses to hide itself.
     update(&model, .{ .toggle_markdown_preview = 1 }, &fx);
+    try std.testing.expect(model.primary_markdown_preview_visible());
+
+    update(&model, .{ .toggle_markdown_editor = 1 }, &fx);
     try std.testing.expect(model.primary_markdown_editor_visible());
+    try std.testing.expect(model.primary_uses_editor());
+    update(&model, .{ .toggle_markdown_preview = 1 }, &fx);
     try std.testing.expect(!model.primary_markdown_preview_visible());
     update(&model, .{ .toggle_markdown_editor = 1 }, &fx);
     try std.testing.expect(model.primary_markdown_editor_visible());
-    update(&model, .{ .toggle_markdown_preview = 1 }, &fx);
-    update(&model, .{ .toggle_markdown_editor = 1 }, &fx);
-    try std.testing.expect(!model.primary_markdown_editor_visible());
+}
+
+test "the explorer Edit action opens Markdown with the editor showing" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx: Effects = undefined;
+    openFile(&model, .{ .project_id = 1, .path = "README.md", .markdown = "# Test", .edit = true }, &fx);
+    try std.testing.expect(model.primary_markdown_editor_visible());
     try std.testing.expect(model.primary_markdown_preview_visible());
+}
+
+test "a search hit carries its line into the editor URL" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx: Effects = undefined;
+    openFile(&model, .{ .project_id = 1, .path = "src/main.zig", .line = 42 }, &fx);
+    try std.testing.expect(std.mem.endsWith(u8, model.primaryEditorUrl(), "&line=42"));
+}
+
+test "renaming a path follows every open tab beneath it" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx: Effects = undefined;
+    openFile(&model, .{ .project_id = 1, .path = "src/main.zig" }, &fx);
+    openFile(&model, .{ .project_id = 1, .path = "README.md", .markdown = "# One" }, &fx);
+    const layout = model.activeLayout().?;
+    layout.file_tabs[0].dirty = true;
+
+    update(&model, .{ .path_moved = .{ .project_id = 1, .from = "src", .to = "source" } }, &fx);
+    try std.testing.expectEqualStrings("source/main.zig", layout.file_tabs[0].path());
+    try std.testing.expect(layout.file_tabs[0].dirty);
+    try std.testing.expectEqualStrings("README.md", layout.file_tabs[1].path());
+
+    update(&model, .{ .path_moved = .{ .project_id = 1, .from = "README.md", .to = "docs/README.md" } }, &fx);
+    try std.testing.expectEqualStrings("docs/README.md", layout.file_tabs[1].path());
+    try std.testing.expectEqualStrings("README.md", layout.file_tabs[1].title());
+    // Markdown that arrived by rename has no preview body yet.
+    update(&model, .{ .path_moved = .{ .project_id = 1, .from = "source/main.zig", .to = "source/main.md" } }, &fx);
+    try std.testing.expect(layout.file_tabs[0].markdown_editor_visible);
+    try std.testing.expect(!layout.file_tabs[0].markdown_preview_visible);
+}
+
+test "deleting a folder closes the tabs it held" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx: Effects = undefined;
+    openFile(&model, .{ .project_id = 1, .path = "src/main.zig" }, &fx);
+    openFile(&model, .{ .project_id = 1, .path = "README.md", .markdown = "# One" }, &fx);
+    const layout = model.activeLayout().?;
+    layout.file_tabs[0].dirty = true;
+    try std.testing.expectEqual(@as(u8, 2), paneCount(layout, .primary));
+
+    update(&model, .{ .path_deleted = .{ .project_id = 1, .path = "src/" } }, &fx);
+    try std.testing.expect(!layout.file_tabs[0].used);
+    try std.testing.expect(layout.file_tabs[1].used);
+    try std.testing.expectEqual(@as(u8, 1), paneCount(layout, .primary));
+    try std.testing.expect(!model.close_confirmation_open);
 }
 
 test "five WebView panes include every editor and the File Explorer" {
@@ -2633,12 +2953,14 @@ test "file tree reads only the selected absolute project root" {
         done: bool,
         truncated: bool,
         skipped: usize,
+        editable: bool,
     };
     const parsed = try std.json.parseFromSlice(Payload, std.testing.allocator, json, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings(root, parsed.value.root);
     try std.testing.expect(parsed.value.done);
     try std.testing.expect(!parsed.value.truncated);
+    try std.testing.expect(parsed.value.editable);
 
     var saw_root_file = false;
     var saw_nested_file = false;
@@ -2734,6 +3056,377 @@ test "file tree is not truncated after the former 1200 entry limit" {
 
     try std.testing.expectEqual(file_count + 1, total);
     try std.testing.expect(saw_apps);
+}
+
+fn testProject(root: []const u8) ProjectState {
+    var project: ProjectState = .{};
+    project.setPath(root);
+    return project;
+}
+
+test "explorer create, rename, duplicate, and delete act inside the project" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_storage);
+    const project = testProject(root_storage[0..root_len]);
+    const io = std.testing.io;
+
+    try createProjectEntry(io, &project, "notes/", true);
+    try createProjectEntry(io, &project, "notes/todo.md", false);
+    try tmp.dir.writeFile(io, .{ .sub_path = "notes/todo.md", .data = "# Todo" });
+    try std.testing.expectError(error.PathAlreadyExists, createProjectEntry(io, &project, "notes/todo.md", false));
+    try std.testing.expectError(error.PathAlreadyExists, createProjectEntry(io, &project, "notes", true));
+
+    // A new file may name directories the project does not have yet.
+    try createProjectEntry(io, &project, "deep/nested/file.txt", false);
+    try tmp.dir.access(io, "deep/nested/file.txt", .{});
+
+    // Duplicating lands beside the source, so the first free name is " copy".
+    var copy_buffer: [relative_path_capacity]u8 = undefined;
+    const first_copy = try copyProjectEntry(io, &project, "notes/todo.md", "notes", &copy_buffer);
+    try std.testing.expectEqualStrings("notes/todo copy.md", first_copy);
+    const second_copy = try copyProjectEntry(io, &project, "notes/todo.md", "notes", &copy_buffer);
+    try std.testing.expectEqualStrings("notes/todo copy 2.md", second_copy);
+    var content_buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("# Todo", try tmp.dir.readFile(io, "notes/todo copy.md", &content_buffer));
+
+    const folder_copy = try copyProjectEntry(io, &project, "notes/", "", &copy_buffer);
+    try std.testing.expectEqualStrings("notes copy", folder_copy);
+    try tmp.dir.access(io, "notes copy/todo.md", .{});
+
+    try moveProjectEntry(io, &project, "notes/todo.md", "notes/done.md");
+    try tmp.dir.access(io, "notes/done.md", .{});
+    try std.testing.expectError(error.PathAlreadyExists, moveProjectEntry(io, &project, "notes/done.md", "notes/todo copy.md"));
+    // A folder cannot be dropped inside itself.
+    try std.testing.expectError(error.InvalidPath, moveProjectEntry(io, &project, "notes/", "notes/inner"));
+
+    try deleteProjectEntry(io, &project, "notes/done.md");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "notes/done.md", .{}));
+    try deleteProjectEntry(io, &project, "notes copy/");
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "notes copy", .{}));
+}
+
+test "pasting keeps the name in a new folder and suffixes it in the source folder" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(std.testing.io, &root_storage);
+    const project = testProject(root_storage[0..root_len]);
+    const io = std.testing.io;
+
+    try tmp.dir.createDirPath(io, "src/deep");
+    try tmp.dir.writeFile(io, .{ .sub_path = "src/main.zig", .data = "pub fn main() void {}" });
+    try tmp.dir.createDirPath(io, "vendor");
+    var copy_buffer: [relative_path_capacity]u8 = undefined;
+
+    // A free name in the destination folder is kept as-is.
+    const pasted = try copyProjectEntry(io, &project, "src/main.zig", "vendor", &copy_buffer);
+    try std.testing.expectEqualStrings("vendor/main.zig", pasted);
+    var content_buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("pub fn main() void {}", try tmp.dir.readFile(io, "vendor/main.zig", &content_buffer));
+
+    // Pasting again into the same folder suffixes instead of overwriting.
+    const again = try copyProjectEntry(io, &project, "src/main.zig", "vendor", &copy_buffer);
+    try std.testing.expectEqualStrings("vendor/main copy.zig", again);
+    try std.testing.expectEqualStrings("pub fn main() void {}", try tmp.dir.readFile(io, "vendor/main.zig", &content_buffer));
+
+    // Pasting to the project root keeps the name too.
+    const at_root = try copyProjectEntry(io, &project, "src/main.zig", "", &copy_buffer);
+    try std.testing.expectEqualStrings("main.zig", at_root);
+
+    // A folder pasted into a plain sibling copies its whole subtree.
+    const folder = try copyProjectEntry(io, &project, "src/", "vendor", &copy_buffer);
+    try std.testing.expectEqualStrings("vendor/src", folder);
+    try tmp.dir.access(io, "vendor/src/main.zig", .{});
+    try tmp.dir.access(io, "vendor/src/deep", .{});
+
+    // A folder can never be pasted into itself or its own descendant.
+    try std.testing.expectError(error.InvalidPath, copyProjectEntry(io, &project, "src/", "src", &copy_buffer));
+    try std.testing.expectError(error.InvalidPath, copyProjectEntry(io, &project, "src/", "src/deep", &copy_buffer));
+}
+
+test "explorer file actions refuse the Other Open Files project" {
+    var project: ProjectState = .{};
+    project.kind = .external_files;
+    try std.testing.expectError(error.ReadOnlyProject, createProjectEntry(std.testing.io, &project, "a.txt", false));
+    try std.testing.expectError(error.ReadOnlyProject, deleteProjectEntry(std.testing.io, &project, "a.txt"));
+}
+
+test "glob filters accept extensions, folders, and plain substrings" {
+    try std.testing.expect(globMatch("*.zig", "src/main.zig"));
+    try std.testing.expect(!globMatch("*.zig", "src/main.js"));
+    try std.testing.expect(globMatch("src/*", "src/deep/main.zig"));
+    try std.testing.expect(globMatch("src", "app/src/main.zig"));
+    try std.testing.expect(!globMatch("test", "src/main.zig"));
+    try std.testing.expect(globMatch("**/*.md", "docs/guide/readme.md"));
+    try std.testing.expect(searchPathAllowed("src/main.zig", "*.zig", "*.md"));
+    try std.testing.expect(!searchPathAllowed("src/main.zig", "*.md", ""));
+    try std.testing.expect(!searchPathAllowed("src/main.zig", "", "*.zig, *.md"));
+}
+
+const SearchPayload = struct {
+    matches: []const struct {
+        path: []const u8,
+        line: u32,
+        before: []const u8,
+        match: []const u8,
+        after: []const u8,
+    },
+    nextFileOffset: usize,
+    nextMatchOffset: usize,
+    done: bool,
+    skipped: usize,
+};
+
+test "search in files honours case, whole word, and path filters" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "alpha.txt", .data = "needle here\nNeedle again\nneedles plural\n" });
+    try tmp.dir.createDirPath(io, "docs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "docs/beta.md", .data = "no match\nneedle in docs\n" });
+    try tmp.dir.createDirPath(io, ".git");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".git/gamma.txt", .data = "needle ignored\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "binary.bin", .data = "needle\x00hidden" });
+
+    var root_storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_storage);
+    const root = root_storage[0..root_len];
+    var output: [12 * 1024]u8 = undefined;
+
+    {
+        const json = try writeSearchJson(io, root, .{ .query = "needle" }, &output);
+        const parsed = try std.json.parseFromSlice(SearchPayload, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.done);
+        try std.testing.expectEqual(@as(usize, 4), parsed.value.matches.len);
+        for (parsed.value.matches) |match| {
+            try std.testing.expect(!std.mem.startsWith(u8, match.path, ".git"));
+            try std.testing.expect(!std.mem.eql(u8, match.path, "binary.bin"));
+        }
+    }
+    {
+        const json = try writeSearchJson(io, root, .{ .query = "needle", .matchCase = true }, &output);
+        const parsed = try std.json.parseFromSlice(SearchPayload, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 3), parsed.value.matches.len);
+    }
+    {
+        const json = try writeSearchJson(io, root, .{ .query = "needle", .wholeWord = true }, &output);
+        const parsed = try std.json.parseFromSlice(SearchPayload, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 3), parsed.value.matches.len);
+    }
+    {
+        const json = try writeSearchJson(io, root, .{ .query = "needle", .include = "*.md" }, &output);
+        const parsed = try std.json.parseFromSlice(SearchPayload, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.matches.len);
+        try std.testing.expectEqualStrings("docs/beta.md", parsed.value.matches[0].path);
+        try std.testing.expectEqual(@as(u32, 2), parsed.value.matches[0].line);
+        try std.testing.expectEqualStrings("", parsed.value.matches[0].before);
+        try std.testing.expectEqualStrings("needle", parsed.value.matches[0].match);
+        try std.testing.expectEqualStrings(" in docs", parsed.value.matches[0].after);
+    }
+    {
+        const json = try writeSearchJson(io, root, .{ .query = "needle", .exclude = "*.md" }, &output);
+        const parsed = try std.json.parseFromSlice(SearchPayload, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 3), parsed.value.matches.len);
+    }
+    try std.testing.expectError(error.InvalidSearchQuery, writeSearchJson(io, root, .{ .query = "" }, &output));
+}
+
+test "search paginates through every match without repeating one" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    const line = "alpha needle beta needle gamma needle delta needle epsilon needle zeta\n";
+    var body: [4096]u8 = undefined;
+    var body_writer: std.Io.Writer = .fixed(&body);
+    for (0..40) |_| try body_writer.writeAll(line);
+    for (0..6) |index| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "file-{d}.txt", .{index});
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = body_writer.buffered() });
+    }
+
+    var root_storage: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_storage);
+    const root = root_storage[0..root_len];
+
+    var output: [12 * 1024]u8 = undefined;
+    var request: BridgeSearchRequest = .{ .query = "needle" };
+    var total: usize = 0;
+    var pages: usize = 0;
+    while (true) {
+        const json = try writeSearchJson(io, root, request, &output);
+        const parsed = try std.json.parseFromSlice(SearchPayload, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        total += parsed.value.matches.len;
+        pages += 1;
+        if (parsed.value.done) break;
+        try std.testing.expect(parsed.value.matches.len > 0);
+        try std.testing.expect(pages < 200);
+        request.fileOffset = parsed.value.nextFileOffset;
+        request.matchOffset = parsed.value.nextMatchOffset;
+    }
+    try std.testing.expect(pages > 1);
+    try std.testing.expectEqual(@as(usize, 6 * 40 * 5), total);
+}
+
+// A terminal's grid comes from its laid-out frame, then the SDK clamps
+// cols * rows to the per-view glyph budget by giving up ROWS. Unpatched, a
+// full-width pane on a 1920-wide display was handed 34 of the 52 rows it had
+// room for and stopped a third short of the panel's height.
+test "a full-width terminal pane keeps every row its height allows" {
+    const tokens: canvas.DesignTokens = .{};
+    const metrics = canvas.terminalCellMetrics(tokens);
+    try std.testing.expect(metrics.width > 0 and metrics.height > 0);
+
+    // The widest realistic pane: a maximized 1920x1080 window with the
+    // explorer collapsed, less the terminal widget's 8pt inset on each side.
+    const content_width: f32 = 1653 - 16;
+    const content_height: f32 = 963 - 16;
+    const wanted_cols: usize = @intFromFloat(@floor(content_width / metrics.width));
+    const wanted_rows: usize = @intFromFloat(@floor(content_height / metrics.height));
+    const grid = canvas.clampTerminalGrid(wanted_cols, wanted_rows);
+    try std.testing.expectEqual(wanted_cols, @as(usize, grid.x));
+    try std.testing.expectEqual(wanted_rows, @as(usize, grid.y));
+}
+
+// The inverse of `explorerDropPoint`: where the File Explorer WebView would put
+// a window point in its own coordinates, for a default 1440x920 window.
+fn explorerDrop(model: *const Model, window_x: f32, window_y: f32, path: []const u8, absolute: []const u8) DropFileMessage {
+    const layout = model.activeLayoutConst().?;
+    const content_width = window_width * (1 - model.project_sidebar_fraction);
+    const explorer_top = workspace_chrome_height + explorer_chrome_height;
+    return .{
+        .project_id = model.active_project_id,
+        .path = path,
+        .absolute = absolute,
+        .x = window_x - (window_width - content_width),
+        .y = window_y - explorer_top,
+        .viewWidth = content_width * layout.explorer_fraction,
+        .viewHeight = window_height - explorer_top,
+    };
+}
+
+test "an explorer drop point maps back into window coordinates" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    const point = explorerDropPoint(&model, explorerDrop(&model, 1200, 50, "two.zig", "/tmp/project/two.zig")).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 1200), point.x, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 50), point.y, 0.01);
+    try std.testing.expectApproxEqAbs(window_width, point.viewWidth, 0.01);
+    try std.testing.expectApproxEqAbs(window_height, point.viewHeight, 0.01);
+}
+
+test "a file dropped on a split pane lands in that pane, not the active one" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx: Effects = undefined;
+    openFile(&model, .{ .project_id = 1, .path = "one.zig" }, &fx);
+    const layout = model.activeLayout().?;
+    layout.secondary_panel_open = true;
+    layout.split_mode = .vertical;
+    try std.testing.expectEqual(Pane.primary, layout.active_pane);
+
+    // The right branch starts at 1031pt, and the tab strip is the first 25pt
+    // under the 43pt window chrome.
+    dropFile(&model, explorerDrop(&model, 1200, 50, "two.zig", "/tmp/project/two.zig"), &fx);
+    try std.testing.expectEqual(Pane.secondary, paneForTab(layout, 2).?);
+    try std.testing.expectEqual(Pane.primary, paneForTab(layout, 1).?);
+
+    // The same file dropped back on the left branch moves its one tab over
+    // rather than opening a second copy of it.
+    dropFile(&model, explorerDrop(&model, 700, 50, "two.zig", "/tmp/project/two.zig"), &fx);
+    try std.testing.expectEqual(Pane.primary, paneForTab(layout, 2).?);
+    try std.testing.expect(!layout.secondary_panel_open);
+}
+
+test "an empty split pane takes a drop anywhere in it" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx: Effects = undefined;
+    openFile(&model, .{ .project_id = 1, .path = "one.zig" }, &fx);
+    const layout = model.activeLayout().?;
+    layout.secondary_panel_open = true;
+    layout.split_mode = .vertical;
+    layout.secondary_child_open = true;
+    layout.secondary_child_mode = .horizontal;
+
+    // The lower half of the right branch holds no tabs at all, so its empty
+    // state is the drop target across its whole height.
+    dropFile(&model, explorerDrop(&model, 1200, 700, "two.zig", "/tmp/project/two.zig"), &fx);
+    try std.testing.expectEqual(Pane.quaternary, paneForTab(layout, 2).?);
+}
+
+test "a file dropped into a terminal is typed as a quoted path" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    openTerminalIn(&model, 1, &fx);
+    const layout = model.activeLayout().?;
+    try std.testing.expectEqual(@as(u8, 9), layout.pane_active_tabs[paneIndex(.primary)]);
+
+    // Below the tab strip the pane is the terminal itself, so the path is
+    // typed at its prompt instead of opening a tab.
+    dropFile(&model, explorerDrop(&model, 700, 400, "two.zig", "/tmp/project/two.zig"), &fx);
+    try std.testing.expectEqualStrings("/tmp/project/two.zig ", fx.ptyWrittenBytes(terminalKey(1, 0)));
+    try std.testing.expectEqual(@as(?Pane, null), paneForTab(layout, 1));
+
+    // The same terminal pane's tab strip still opens files.
+    dropFile(&model, explorerDrop(&model, 700, 50, "two.zig", "/tmp/project/two.zig"), &fx);
+    try std.testing.expectEqual(Pane.primary, paneForTab(layout, 1).?);
+    try std.testing.expectEqualStrings("/tmp/project/two.zig ", fx.ptyWrittenBytes(terminalKey(1, 0)));
+}
+
+test "a drop released back over the sidebar or explorer changes nothing" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx: Effects = undefined;
+    const layout = model.activeLayout().?;
+    dropFile(&model, explorerDrop(&model, 120, 400, "two.zig", "/tmp/project/two.zig"), &fx);
+    dropFile(&model, explorerDrop(&model, 300, 400, "two.zig", "/tmp/project/two.zig"), &fx);
+    dropFile(&model, explorerDrop(&model, 700, 20, "two.zig", "/tmp/project/two.zig"), &fx);
+    // Past the window edge the release belongs to another application.
+    dropFile(&model, explorerDrop(&model, window_width + 40, 400, "two.zig", "/tmp/project/two.zig"), &fx);
+    dropFile(&model, explorerDrop(&model, 700, window_height + 40, "two.zig", "/tmp/project/two.zig"), &fx);
+    try std.testing.expectEqual(@as(u8, 0), paneCount(layout, .primary));
+}
+
+test "a dropped path reaches the shell as one word" {
+    var buffer: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("/tmp/plain-path.zig ", shellQuotePath("/tmp/plain-path.zig", &buffer).?);
+    try std.testing.expectEqualStrings("'/tmp/two words.zig' ", shellQuotePath("/tmp/two words.zig", &buffer).?);
+    try std.testing.expectEqualStrings("'/tmp/it'\\''s.zig' ", shellQuotePath("/tmp/it's.zig", &buffer).?);
+    try std.testing.expectEqualStrings("'/tmp/$(rm -rf ~).zig' ", shellQuotePath("/tmp/$(rm -rf ~).zig", &buffer).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), shellQuotePath("/tmp/short.zig", buffer[0..4]));
+}
+
+test "search trims a long line to a window around the match" {
+    var line_buffer: [2048]u8 = undefined;
+    @memset(&line_buffer, 'a');
+    const at = 900;
+    @memcpy(line_buffer[at .. at + 6], "needle");
+    const preview = searchPreview(&line_buffer, at, 6);
+    try std.testing.expectEqualStrings("needle", preview.match);
+    try std.testing.expect(preview.before.len + preview.match.len + preview.after.len <= search_max_line_bytes);
+    try std.testing.expect(preview.before.len > 0);
+    try std.testing.expect(preview.after.len > 0);
+
+    const short = searchPreview("alpha needle beta", 6, 6);
+    try std.testing.expectEqualStrings("alpha ", short.before);
+    try std.testing.expectEqualStrings("needle", short.match);
+    try std.testing.expectEqualStrings(" beta", short.after);
 }
 
 const app_permissions = [_][]const u8{
@@ -2844,6 +3537,42 @@ pub fn appOptions(_: std.Io) DocyrusApp.Options {
 
 const BridgePath = struct {
     path: []const u8,
+    edit: bool = false,
+    line: u32 = 0,
+};
+
+// A drag released outside the File Explorer WebView, reported in the WebView's
+// own coordinates along with its viewport so the workspace can place it.
+// The widest absolute path the bridge handlers build before dispatching.
+const bridge_path_capacity: usize = 2048;
+
+const BridgeDropPath = struct {
+    path: []const u8,
+    x: f32 = 0,
+    y: f32 = 0,
+    viewWidth: f32 = 0,
+    viewHeight: f32 = 0,
+};
+
+const BridgeCreateEntry = struct {
+    path: []const u8,
+    directory: bool = false,
+};
+
+const BridgeMovePath = struct {
+    from: []const u8,
+    to: []const u8,
+};
+
+const BridgeCopyPath = struct {
+    path: []const u8,
+    absolute: bool = false,
+};
+
+const BridgeCopyEntry = struct {
+    path: []const u8,
+    // Absent means "duplicate in place": the folder the source already sits in.
+    destination: ?[]const u8 = null,
 };
 
 const BridgeProjectSlot = struct {
@@ -2988,7 +3717,9 @@ const AppHost = struct {
         return &self.ui.model.projects[project_id - 1];
     }
 
-    fn activeBridgeProject(self: *AppHost) !struct { id: u32, project: *ProjectState } {
+    const ActiveProject = struct { id: u32, project: *ProjectState };
+
+    fn activeBridgeProject(self: *AppHost) !ActiveProject {
         const project_id = self.ui.model.active_project_id;
         if (project_id == 0 or project_id > self.ui.model.project_count) return error.UnknownProject;
         return .{ .id = project_id, .project = &self.ui.model.projects[project_id - 1] };
@@ -3024,10 +3755,143 @@ const AppHost = struct {
         }
         defer if (markdown.len > 0) std.heap.page_allocator.free(markdown);
         const runtime = self.runtime orelse return error.RuntimeNotReady;
-        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .open_file = .{ .project_id = active.id, .path = open_path, .markdown = markdown } });
+        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .open_file = .{
+            .project_id = active.id,
+            .path = open_path,
+            .markdown = markdown,
+            .edit = parsed.value.edit,
+            .line = parsed.value.line,
+        } });
         var writer: std.Io.Writer = .fixed(output);
         try writer.writeAll("true");
         return writer.buffered();
+    }
+
+    fn dropPath(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *AppHost = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, invocation.source.webview_label, tree_view_label)) return error.InvalidBridgeSource;
+        const parsed = try std.json.parseFromSlice(BridgeDropPath, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (!isSafeRelativePath(parsed.value.path) or std.mem.endsWith(u8, parsed.value.path, "/")) return error.InvalidPath;
+        const active = try self.activeBridgeProject();
+        const project = active.project;
+        var absolute_buffer: [bridge_path_capacity]u8 = undefined;
+        const open_path = if (project.kind == .external_files)
+            (externalFileForTreeName(&self.ui.model, parsed.value.path) orelse return error.InvalidPath).path()
+        else
+            parsed.value.path;
+        const absolute = try fullPath(project, open_path, &absolute_buffer);
+        var markdown: []u8 = &.{};
+        if (fileKind(open_path) == .markdown) {
+            markdown = std.Io.Dir.cwd().readFileAlloc(self.io, absolute, std.heap.page_allocator, .limited(markdown_capacity)) catch &.{};
+        }
+        defer if (markdown.len > 0) std.heap.page_allocator.free(markdown);
+        const runtime = self.runtime orelse return error.RuntimeNotReady;
+        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .drop_file = .{
+            .project_id = active.id,
+            .path = open_path,
+            .absolute = absolute,
+            .markdown = markdown,
+            .x = parsed.value.x,
+            .y = parsed.value.y,
+            .viewWidth = parsed.value.viewWidth,
+            .viewHeight = parsed.value.viewHeight,
+        } });
+        var writer: std.Io.Writer = .fixed(output);
+        try writer.writeAll("true");
+        return writer.buffered();
+    }
+
+    fn treeProject(self: *AppHost, invocation: native_sdk.bridge.Invocation) !ActiveProject {
+        if (!std.mem.eql(u8, invocation.source.webview_label, tree_view_label)) return error.InvalidBridgeSource;
+        const active = try self.activeBridgeProject();
+        if (active.project.kind != .folder) return error.ReadOnlyProject;
+        return active;
+    }
+
+    fn createEntry(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *AppHost = @ptrCast(@alignCast(context));
+        const parsed = try std.json.parseFromSlice(BridgeCreateEntry, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const active = try self.treeProject(invocation);
+        if (!isSafeRelativePath(parsed.value.path)) return error.InvalidPath;
+        try createProjectEntry(self.io, active.project, parsed.value.path, parsed.value.directory);
+        return native_sdk.bridge.writeJsonStringValue(output, trimTreePath(parsed.value.path));
+    }
+
+    fn movePath(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *AppHost = @ptrCast(@alignCast(context));
+        const parsed = try std.json.parseFromSlice(BridgeMovePath, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const active = try self.treeProject(invocation);
+        if (!isSafeRelativePath(parsed.value.from) or !isSafeRelativePath(parsed.value.to)) return error.InvalidPath;
+        try moveProjectEntry(self.io, active.project, parsed.value.from, parsed.value.to);
+        const runtime = self.runtime orelse return error.RuntimeNotReady;
+        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .path_moved = .{
+            .project_id = active.id,
+            .from = parsed.value.from,
+            .to = parsed.value.to,
+        } });
+        return native_sdk.bridge.writeJsonStringValue(output, trimTreePath(parsed.value.to));
+    }
+
+    fn deletePath(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *AppHost = @ptrCast(@alignCast(context));
+        const parsed = try std.json.parseFromSlice(BridgePath, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const active = try self.treeProject(invocation);
+        if (!isSafeRelativePath(parsed.value.path)) return error.InvalidPath;
+        try deleteProjectEntry(self.io, active.project, parsed.value.path);
+        const runtime = self.runtime orelse return error.RuntimeNotReady;
+        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .path_deleted = .{
+            .project_id = active.id,
+            .path = parsed.value.path,
+        } });
+        var writer: std.Io.Writer = .fixed(output);
+        try writer.writeAll("true");
+        return writer.buffered();
+    }
+
+    fn copyEntry(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *AppHost = @ptrCast(@alignCast(context));
+        const parsed = try std.json.parseFromSlice(BridgeCopyEntry, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const active = try self.treeProject(invocation);
+        if (!isSafeRelativePath(parsed.value.path)) return error.InvalidPath;
+        const destination = if (parsed.value.destination) |folder| blk: {
+            // "" is the project root, which is not a safe relative path.
+            if (folder.len > 0 and !isSafeRelativePath(folder)) return error.InvalidPath;
+            break :blk folder;
+        } else std.fs.path.dirname(trimTreePath(parsed.value.path)) orelse "";
+        var copy_buffer: [relative_path_capacity]u8 = undefined;
+        const created = try copyProjectEntry(self.io, active.project, parsed.value.path, destination, &copy_buffer);
+        return native_sdk.bridge.writeJsonStringValue(output, created);
+    }
+
+    fn copyPath(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *AppHost = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, invocation.source.webview_label, tree_view_label)) return error.InvalidBridgeSource;
+        const parsed = try std.json.parseFromSlice(BridgeCopyPath, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const active = try self.activeBridgeProject();
+        if (!isSafeRelativePath(parsed.value.path)) return error.InvalidPath;
+        const relative = trimTreePath(parsed.value.path);
+        var absolute_buffer: [2048]u8 = undefined;
+        const text = if (parsed.value.absolute)
+            try fullPath(active.project, relative, &absolute_buffer)
+        else
+            relative;
+        const runtime = self.runtime orelse return error.RuntimeNotReady;
+        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .copy_text = text });
+        return native_sdk.bridge.writeJsonStringValue(output, text);
+    }
+
+    fn searchFiles(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *AppHost = @ptrCast(@alignCast(context));
+        const parsed = try std.json.parseFromSlice(BridgeSearchRequest, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const active = try self.treeProject(invocation);
+        return writeSearchJson(self.io, active.project.path(), parsed.value, output);
     }
 
     fn readFile(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -3177,7 +4041,7 @@ fn writeExternalTreeJson(model: *const Model, offset: usize, output: []u8) ![]co
     try writer.print("{d}", .{index});
     try writer.writeAll(",\"done\":");
     try writer.writeAll(if (index >= count) "true" else "false");
-    try writer.writeAll(",\"truncated\":false,\"skipped\":0}");
+    try writer.writeAll(",\"truncated\":false,\"skipped\":0,\"editable\":false}");
     return writer.buffered();
 }
 
@@ -3272,6 +4136,384 @@ fn writeProjectTreeJson(io: std.Io, project_path: []const u8, offset: usize, out
     try writer.writeAll(",\"truncated\":false");
     try writer.writeAll(",\"skipped\":");
     try writer.print("{d}", .{skipped});
+    try writer.writeAll(",\"editable\":true");
+    try writer.writeByte('}');
+    return writer.buffered();
+}
+
+fn trimTreePath(path: []const u8) []const u8 {
+    return std.mem.trimEnd(u8, path, "/");
+}
+
+fn entryExists(io: std.Io, absolute: []const u8) bool {
+    std.Io.Dir.cwd().access(io, absolute, .{}) catch return false;
+    return true;
+}
+
+fn folderProjectPath(project: *const ProjectState, relative: []const u8, output: []u8) ![]const u8 {
+    if (project.kind != .folder) return error.ReadOnlyProject;
+    const trimmed = trimTreePath(relative);
+    if (trimmed.len == 0) return error.InvalidPath;
+    return fullPath(project, trimmed, output);
+}
+
+fn createProjectEntry(io: std.Io, project: *const ProjectState, relative: []const u8, directory: bool) !void {
+    var absolute_buffer: [2048]u8 = undefined;
+    const absolute = try folderProjectPath(project, relative, &absolute_buffer);
+    if (entryExists(io, absolute)) return error.PathAlreadyExists;
+    if (directory) {
+        try std.Io.Dir.cwd().createDirPath(io, absolute);
+        return;
+    }
+    // A typed name may carry directories the project does not have yet.
+    if (std.fs.path.dirname(absolute)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+    const file = try std.Io.Dir.cwd().createFile(io, absolute, .{ .exclusive = true });
+    file.close(io);
+}
+
+fn moveProjectEntry(io: std.Io, project: *const ProjectState, from: []const u8, to: []const u8) !void {
+    const trimmed_from = trimTreePath(from);
+    const trimmed_to = trimTreePath(to);
+    if (std.mem.eql(u8, trimmed_from, trimmed_to)) return;
+    // Moving a directory under itself would detach the subtree from the project.
+    if (trimmed_to.len > trimmed_from.len and
+        std.mem.startsWith(u8, trimmed_to, trimmed_from) and
+        trimmed_to[trimmed_from.len] == '/') return error.InvalidPath;
+    var from_buffer: [2048]u8 = undefined;
+    var to_buffer: [2048]u8 = undefined;
+    const absolute_from = try folderProjectPath(project, trimmed_from, &from_buffer);
+    const absolute_to = try folderProjectPath(project, trimmed_to, &to_buffer);
+    if (entryExists(io, absolute_to)) return error.PathAlreadyExists;
+    if (std.fs.path.dirname(absolute_to)) |parent| try std.Io.Dir.cwd().createDirPath(io, parent);
+    try std.Io.Dir.renameAbsolute(absolute_from, absolute_to, io);
+}
+
+fn deleteProjectEntry(io: std.Io, project: *const ProjectState, relative: []const u8) !void {
+    var absolute_buffer: [2048]u8 = undefined;
+    const absolute = try folderProjectPath(project, relative, &absolute_buffer);
+    const info = try std.Io.Dir.cwd().statFile(io, absolute, .{ .follow_symlinks = false });
+    if (info.kind == .directory) {
+        try std.Io.Dir.cwd().deleteTree(io, absolute);
+    } else {
+        try std.Io.Dir.cwd().deleteFile(io, absolute);
+    }
+}
+
+fn copyCandidatePath(directory: []const u8, base: []const u8, attempt: usize, output: []u8) ![]const u8 {
+    const extension = std.fs.path.extension(base);
+    const stem = base[0 .. base.len - extension.len];
+    var name_buffer: [title_capacity + 32]u8 = undefined;
+    const name = switch (attempt) {
+        0 => base,
+        1 => try std.fmt.bufPrint(&name_buffer, "{s} copy{s}", .{ stem, extension }),
+        else => try std.fmt.bufPrint(&name_buffer, "{s} copy {d}{s}", .{ stem, attempt, extension }),
+    };
+    if (directory.len == 0) return std.fmt.bufPrint(output, "{s}", .{name});
+    return std.fmt.bufPrint(output, "{s}/{s}", .{ directory, name });
+}
+
+fn copyDirectoryTree(io: std.Io, source: []const u8, destination: []const u8) !void {
+    var directory = try std.Io.Dir.openDirAbsolute(io, source, .{ .iterate = true });
+    defer directory.close(io);
+    var walker = try directory.walkSelectively(std.heap.page_allocator);
+    defer {
+        while (walker.stack.items.len > 1) walker.leave(io);
+        walker.deinit();
+    }
+    try std.Io.Dir.cwd().createDirPath(io, destination);
+    while (true) {
+        const entry = walker.next(io) catch continue orelse break;
+        if (entry.path.len > relative_path_capacity) continue;
+        var target_buffer: [2048]u8 = undefined;
+        const target = std.fmt.bufPrint(&target_buffer, "{s}/{s}", .{ destination, entry.path }) catch continue;
+        switch (entry.kind) {
+            .directory => {
+                try std.Io.Dir.cwd().createDirPath(io, target);
+                walker.enter(io, entry) catch {};
+            },
+            .file => try entry.dir.copyFile(entry.basename, .cwd(), target, io, .{}),
+            else => {},
+        }
+    }
+}
+
+// Copy `relative` into the folder `destination` ("" is the project root),
+// keeping its name when that is free and adding a " copy" suffix when it is
+// not. Duplicating in place is the same call with the source's own folder.
+fn copyProjectEntry(io: std.Io, project: *const ProjectState, relative: []const u8, destination: []const u8, output: []u8) ![]const u8 {
+    var source_buffer: [2048]u8 = undefined;
+    const source = try folderProjectPath(project, relative, &source_buffer);
+    const info = try std.Io.Dir.cwd().statFile(io, source, .{ .follow_symlinks = false });
+    const trimmed = trimTreePath(relative);
+    const directory = trimTreePath(destination);
+    // Copying a folder into its own subtree would recurse into the copy.
+    if (info.kind == .directory and
+        (std.mem.eql(u8, directory, trimmed) or
+            (directory.len > trimmed.len and std.mem.startsWith(u8, directory, trimmed) and directory[trimmed.len] == '/'))) return error.InvalidPath;
+
+    var attempt: usize = 0;
+    while (attempt <= 99) : (attempt += 1) {
+        const candidate = try copyCandidatePath(directory, std.fs.path.basename(trimmed), attempt, output);
+        var target_buffer: [2048]u8 = undefined;
+        const target = try folderProjectPath(project, candidate, &target_buffer);
+        if (entryExists(io, target)) continue;
+        if (info.kind == .directory) {
+            try copyDirectoryTree(io, source, target);
+        } else {
+            try std.Io.Dir.cwd().copyFile(source, .cwd(), target, io, .{ .replace = false });
+        }
+        return candidate;
+    }
+    return error.PathAlreadyExists;
+}
+
+const BridgeSearchRequest = struct {
+    query: []const u8 = "",
+    matchCase: bool = false,
+    wholeWord: bool = false,
+    include: []const u8 = "",
+    exclude: []const u8 = "",
+    fileOffset: usize = 0,
+    matchOffset: usize = 0,
+};
+
+fn isWordByte(byte: u8) bool {
+    return std.ascii.isAlphanumeric(byte) or byte == '_';
+}
+
+fn isWholeWordMatch(line: []const u8, at: usize, length: usize) bool {
+    if (at > 0 and isWordByte(line[at - 1])) return false;
+    const end = at + length;
+    if (end < line.len and isWordByte(line[end])) return false;
+    return true;
+}
+
+fn findSearchMatch(line: []const u8, query: []const u8, match_case: bool, whole_word: bool, start: usize) ?usize {
+    var from = start;
+    while (from <= line.len) {
+        const found = if (match_case)
+            std.mem.indexOfPos(u8, line, from, query)
+        else
+            std.ascii.indexOfIgnoreCasePos(line, from, query);
+        const at = found orelse return null;
+        if (!whole_word or isWholeWordMatch(line, at, query.len)) return at;
+        from = at + 1;
+    }
+    return null;
+}
+
+// Wildcard match with `*` (any run, separators included) and `?` (one byte).
+// A pattern without wildcards is a plain substring test, so "src" filters the
+// way a user typing a folder name expects.
+fn globMatch(pattern: []const u8, text: []const u8) bool {
+    if (std.mem.indexOfAny(u8, pattern, "*?") == null) return std.mem.indexOf(u8, text, pattern) != null;
+    var pattern_index: usize = 0;
+    var text_index: usize = 0;
+    var star: ?usize = null;
+    var star_text: usize = 0;
+    while (text_index < text.len) {
+        if (pattern_index < pattern.len and (pattern[pattern_index] == '?' or pattern[pattern_index] == text[text_index])) {
+            pattern_index += 1;
+            text_index += 1;
+        } else if (pattern_index < pattern.len and pattern[pattern_index] == '*') {
+            star = pattern_index;
+            star_text = text_index;
+            pattern_index += 1;
+        } else if (star) |resume_at| {
+            pattern_index = resume_at + 1;
+            star_text += 1;
+            text_index = star_text;
+        } else return false;
+    }
+    while (pattern_index < pattern.len and pattern[pattern_index] == '*') pattern_index += 1;
+    return pattern_index == pattern.len;
+}
+
+fn matchesAnyGlob(patterns: []const u8, text: []const u8) bool {
+    var candidates = std.mem.tokenizeAny(u8, patterns, ",");
+    while (candidates.next()) |raw| {
+        const pattern = std.mem.trim(u8, raw, " \t");
+        if (pattern.len == 0) continue;
+        if (globMatch(pattern, text)) return true;
+    }
+    return false;
+}
+
+fn searchPathAllowed(relative: []const u8, include: []const u8, exclude: []const u8) bool {
+    if (include.len > 0 and !matchesAnyGlob(include, relative)) return false;
+    if (exclude.len > 0 and matchesAnyGlob(exclude, relative)) return false;
+    return true;
+}
+
+fn utf8BoundaryBefore(bytes: []const u8, index: usize) usize {
+    var cursor = @min(index, bytes.len);
+    while (cursor > 0 and cursor < bytes.len and (bytes[cursor] & 0xC0) == 0x80) cursor -= 1;
+    return cursor;
+}
+
+const SearchPreview = struct {
+    before: []const u8 = "",
+    match: []const u8 = "",
+    after: []const u8 = "",
+};
+
+fn utf8OrEmpty(bytes: []const u8) []const u8 {
+    return if (std.unicode.utf8ValidateSlice(bytes)) bytes else "";
+}
+
+// Long lines travel as a window around the match so one minified file cannot
+// spend the whole bridge response. The window arrives already split around the
+// hit: a byte column would not survive the trip into UTF-16 JavaScript strings.
+fn searchPreview(line: []const u8, at: usize, length: usize) SearchPreview {
+    const match_end = @min(line.len, at + length);
+    var start: usize = 0;
+    var end: usize = line.len;
+    if (line.len > search_max_line_bytes) {
+        const lead: usize = search_max_line_bytes / 4;
+        start = utf8BoundaryBefore(line, if (at > lead) at - lead else 0);
+        end = utf8BoundaryBefore(line, @min(line.len, start + search_max_line_bytes));
+        if (end < match_end) end = match_end;
+    }
+    return .{
+        .before = utf8OrEmpty(line[start..at]),
+        .match = utf8OrEmpty(line[at..match_end]),
+        .after = utf8OrEmpty(line[match_end..end]),
+    };
+}
+
+const SearchMatchJson = struct {
+    path: []const u8,
+    line: u32,
+    before: []const u8,
+    match: []const u8,
+    after: []const u8,
+};
+
+fn writeSearchJson(io: std.Io, project_path: []const u8, request: BridgeSearchRequest, output: []u8) ![]const u8 {
+    if (request.query.len == 0 or request.query.len > search_max_query_bytes) return error.InvalidSearchQuery;
+    if (!std.fs.path.isAbsolute(project_path)) return error.InvalidProjectPath;
+
+    var directory = try std.Io.Dir.openDirAbsolute(io, project_path, .{ .iterate = true });
+    defer directory.close(io);
+    var walker = try directory.walkSelectively(std.heap.page_allocator);
+    defer {
+        while (walker.stack.items.len > 1) walker.leave(io);
+        walker.deinit();
+    }
+
+    var writer: std.Io.Writer = .fixed(output);
+    try writer.writeAll("{\"matches\":[");
+
+    const response_budget = @min(output.len, bridge_tree_page_budget);
+    var first = true;
+    var file_index: usize = 0;
+    var next_file_offset = request.fileOffset;
+    var next_match_offset = request.matchOffset;
+    var skipped: usize = 0;
+    var scanned: usize = 0;
+    var done = false;
+    var page_full = false;
+
+    walk: while (true) {
+        const entry = walker.next(io) catch {
+            skipped += 1;
+            continue;
+        } orelse {
+            done = true;
+            break;
+        };
+
+        if (entry.kind == .directory) {
+            if (ignoredDirectory(entry.basename)) continue;
+            walker.enter(io, entry) catch {
+                skipped += 1;
+            };
+            continue;
+        }
+        if (entry.kind != .file) continue;
+        if (entry.path.len > relative_path_capacity - 2) {
+            skipped += 1;
+            continue;
+        }
+        if (!searchPathAllowed(entry.path, request.include, request.exclude)) continue;
+
+        const current_index = file_index;
+        file_index += 1;
+        if (current_index < request.fileOffset) continue;
+        if (scanned >= search_max_files) break;
+
+        // `entry.path` lives in the walker's shared name buffer, which the next
+        // step overwrites. Keep the copy the response and cursor both need.
+        var relative_buffer: [relative_path_capacity]u8 = undefined;
+        @memcpy(relative_buffer[0..entry.path.len], entry.path);
+        const relative = relative_buffer[0..entry.path.len];
+
+        const content = entry.dir.readFileAlloc(io, entry.basename, std.heap.page_allocator, .limited(search_max_file_bytes)) catch {
+            skipped += 1;
+            next_file_offset = current_index + 1;
+            next_match_offset = 0;
+            continue;
+        };
+        defer std.heap.page_allocator.free(content);
+        scanned += 1;
+
+        const probe = content[0..@min(content.len, 8192)];
+        if (std.mem.indexOfScalar(u8, probe, 0) != null) {
+            next_file_offset = current_index + 1;
+            next_match_offset = 0;
+            continue;
+        }
+
+        const skip_matches = if (current_index == request.fileOffset) request.matchOffset else 0;
+        var file_match_index: usize = 0;
+        var line_number: u32 = 0;
+        var lines = std.mem.splitScalar(u8, content, '\n');
+        file: while (lines.next()) |raw_line| {
+            line_number += 1;
+            const line = std.mem.trimEnd(u8, raw_line, "\r");
+            var from: usize = 0;
+            while (findSearchMatch(line, request.query, request.matchCase, request.wholeWord, from)) |at| {
+                from = at + request.query.len;
+                // One noisy file must not crowd out every other hit.
+                if (file_match_index >= search_max_matches_per_file) break :file;
+                const match_ordinal = file_match_index;
+                file_match_index += 1;
+                if (match_ordinal < skip_matches) continue;
+
+                const preview = searchPreview(line, at, request.query.len);
+                var encoded_buffer: [(search_max_line_bytes + search_max_query_bytes) * 6 + relative_path_capacity * 6 + 160]u8 = undefined;
+                var encoded_writer: std.Io.Writer = .fixed(&encoded_buffer);
+                std.json.Stringify.value(SearchMatchJson{
+                    .path = relative,
+                    .line = line_number,
+                    .before = preview.before,
+                    .match = preview.match,
+                    .after = preview.after,
+                }, .{}, &encoded_writer) catch continue;
+                const encoded = encoded_writer.buffered();
+                if (writer.buffered().len + encoded.len + 160 > response_budget) {
+                    next_file_offset = current_index;
+                    next_match_offset = match_ordinal;
+                    page_full = true;
+                    break :walk;
+                }
+                if (!first) try writer.writeByte(',');
+                first = false;
+                try writer.writeAll(encoded);
+            }
+        }
+        next_file_offset = current_index + 1;
+        next_match_offset = 0;
+    }
+
+    try writer.writeAll("],\"nextFileOffset\":");
+    try writer.print("{d}", .{next_file_offset});
+    try writer.writeAll(",\"nextMatchOffset\":");
+    try writer.print("{d}", .{next_match_offset});
+    try writer.writeAll(",\"done\":");
+    try writer.writeAll(if (done and !page_full) "true" else "false");
+    try writer.writeAll(",\"skipped\":");
+    try writer.print("{d}", .{skipped});
     try writer.writeByte('}');
     return writer.buffered();
 }
@@ -3353,22 +4595,36 @@ pub fn main(init: std.process.Init) !void {
     const bridge_policies = [_]native_sdk.bridge.CommandPolicy{
         .{ .name = "workspace.listTree", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
         .{ .name = "workspace.openPath", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
+        .{ .name = "workspace.dropPath", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
         .{ .name = "workspace.readFile", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
         .{ .name = "workspace.writeFile", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
         .{ .name = "workspace.editorDirty", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
         .{ .name = "workspace.editorAction", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
         .{ .name = "workspace.discardAndClose", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
         .{ .name = "workspace.editorActionFailed", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
+        .{ .name = "workspace.createEntry", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
+        .{ .name = "workspace.movePath", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
+        .{ .name = "workspace.deletePath", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
+        .{ .name = "workspace.copyEntry", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
+        .{ .name = "workspace.copyPath", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
+        .{ .name = "workspace.searchFiles", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
     };
     const bridge_handlers = [_]native_sdk.bridge.Handler{
         .{ .name = "workspace.listTree", .context = &host, .invoke_fn = AppHost.listTree },
         .{ .name = "workspace.openPath", .context = &host, .invoke_fn = AppHost.openPath },
+        .{ .name = "workspace.dropPath", .context = &host, .invoke_fn = AppHost.dropPath },
         .{ .name = "workspace.readFile", .context = &host, .invoke_fn = AppHost.readFile },
         .{ .name = "workspace.writeFile", .context = &host, .invoke_fn = AppHost.writeFile },
         .{ .name = "workspace.editorDirty", .context = &host, .invoke_fn = AppHost.editorDirty },
         .{ .name = "workspace.editorAction", .context = &host, .invoke_fn = AppHost.editorAction },
         .{ .name = "workspace.discardAndClose", .context = &host, .invoke_fn = AppHost.discardAndClose },
         .{ .name = "workspace.editorActionFailed", .context = &host, .invoke_fn = AppHost.editorActionFailed },
+        .{ .name = "workspace.createEntry", .context = &host, .invoke_fn = AppHost.createEntry },
+        .{ .name = "workspace.movePath", .context = &host, .invoke_fn = AppHost.movePath },
+        .{ .name = "workspace.deletePath", .context = &host, .invoke_fn = AppHost.deletePath },
+        .{ .name = "workspace.copyEntry", .context = &host, .invoke_fn = AppHost.copyEntry },
+        .{ .name = "workspace.copyPath", .context = &host, .invoke_fn = AppHost.copyPath },
+        .{ .name = "workspace.searchFiles", .context = &host, .invoke_fn = AppHost.searchFiles },
     };
 
     try runner.runWithOptions(app, .{

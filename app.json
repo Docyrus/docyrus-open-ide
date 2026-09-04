@@ -59,12 +59,19 @@
         "commands": [
             { "name": "workspace.listTree", "permissions": ["filesystem"], "origins": ["zero://app"] },
             { "name": "workspace.openPath", "permissions": ["filesystem"], "origins": ["zero://app"] },
+            { "name": "workspace.dropPath", "permissions": ["filesystem"], "origins": ["zero://app"] },
             { "name": "workspace.readFile", "permissions": ["filesystem"], "origins": ["zero://app"] },
             { "name": "workspace.writeFile", "permissions": ["filesystem"], "origins": ["zero://app"] },
             { "name": "workspace.editorDirty", "permissions": ["filesystem"], "origins": ["zero://app"] },
             { "name": "workspace.editorAction", "permissions": ["filesystem"], "origins": ["zero://app"] },
             { "name": "workspace.discardAndClose", "permissions": ["filesystem"], "origins": ["zero://app"] },
-            { "name": "workspace.editorActionFailed", "permissions": ["filesystem"], "origins": ["zero://app"] }
+            { "name": "workspace.editorActionFailed", "permissions": ["filesystem"], "origins": ["zero://app"] },
+            { "name": "workspace.createEntry", "permissions": ["filesystem"], "origins": ["zero://app"] },
+            { "name": "workspace.movePath", "permissions": ["filesystem"], "origins": ["zero://app"] },
+            { "name": "workspace.deletePath", "permissions": ["filesystem"], "origins": ["zero://app"] },
+            { "name": "workspace.copyEntry", "permissions": ["filesystem"], "origins": ["zero://app"] },
+            { "name": "workspace.copyPath", "permissions": ["filesystem"], "origins": ["zero://app"] },
+            { "name": "workspace.searchFiles", "permissions": ["filesystem"], "origins": ["zero://app"] }
         ]
     },
     "frontend": {

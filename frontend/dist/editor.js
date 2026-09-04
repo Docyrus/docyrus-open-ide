@@ -1,6 +1,7 @@
 const params = new URLSearchParams(window.location.search);
 const projectId = Number(params.get("project") || 0);
 const slot = Number(params.get("slot") || 0);
+const revealLine = Number(params.get("line") || 0);
 const requestedTheme = params.get("theme") || "system";
 const systemDark = window.matchMedia("(prefers-color-scheme: dark)");
 
@@ -96,6 +97,12 @@ require(["vs/editor/editor.main"], async () => {
     });
     document.title = file.relativePath;
     loading.remove();
+    // A hit picked in the explorer's Search tab arrives as a line number.
+    if (Number.isSafeInteger(revealLine) && revealLine > 0) {
+      const line = Math.min(revealLine, editor.getModel().getLineCount());
+      editor.setPosition({ lineNumber: line, column: 1 });
+      editor.revealLineInCenter(line);
+    }
     editor.focus();
 
     let lastReportedDirty = null;

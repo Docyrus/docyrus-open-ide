@@ -51,7 +51,7 @@
   <column grow="1" main="center" cross="center" gap="16" padding="32" label="Empty workspace">
     <icon name="file-text" width="40" height="40" foreground="text_muted" />
     <text size="heading">Start in the File Explorer</text>
-    <text foreground="text_muted" text-alignment="center">Open a file here by dragging its tab into this panel.</text>
+    <text foreground="text_muted" text-alignment="center">Drop a file from the File Explorer here, or drag a tab in, to open it in this panel.</text>
     <button variant="secondary" icon="terminal" on-press="open_terminal_in:{pane_id}">Open Terminal</button>
   </column>
 </template>
