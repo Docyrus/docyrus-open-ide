@@ -278,19 +278,22 @@
 
 <template name="primary-pane">
   <column grow="1" background="background" label="Primary tab panel">
-    <tabs height="28" padding="0" gap="1" background="surface" label="Primary tabs">
-      <for each="primaryTabs" key="id" as="tab">
-        <if test="{tab.selected}">
-          <use template="workspace-tab-active" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
-        </if>
-        <else>
-          <use template="workspace-tab-inactive" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
-        </else>
-      </for>
-      <spacer grow="1" />
+    <row height="28" background="surface">
+      <scroll grow="1" axis="horizontal">
+        <tabs height="28" padding="0" gap="1" label="Primary tabs">
+          <for each="primaryTabs" key="id" as="tab">
+            <if test="{tab.selected}">
+              <use template="workspace-tab-active" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
+            </if>
+            <else>
+              <use template="workspace-tab-inactive" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
+            </else>
+          </for>
+        </tabs>
+      </scroll>
       <if test="{primary_can_split}"><use template="pane-actions" pane_id="1" /></if>
       <else><use template="leaf-pane-actions" pane_id="1" /></else>
-    </tabs>
+    </row>
     <separator />
     <if test="{primary_has_tabs}">
       <use template="primary-content" />
@@ -305,19 +308,22 @@
 
 <template name="secondary-pane">
   <column grow="1" background="background" label="Secondary tab panel">
-    <tabs height="28" padding="0" gap="1" background="surface" label="Secondary tabs">
-      <for each="secondaryTabs" key="id" as="tab">
-        <if test="{tab.selected}">
-          <use template="workspace-tab-active" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
-        </if>
-        <else>
-          <use template="workspace-tab-inactive" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
-        </else>
-      </for>
-      <spacer grow="1" />
+    <row height="28" background="surface">
+      <scroll grow="1" axis="horizontal">
+        <tabs height="28" padding="0" gap="1" label="Secondary tabs">
+          <for each="secondaryTabs" key="id" as="tab">
+            <if test="{tab.selected}">
+              <use template="workspace-tab-active" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
+            </if>
+            <else>
+              <use template="workspace-tab-inactive" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
+            </else>
+          </for>
+        </tabs>
+      </scroll>
       <if test="{secondary_can_split}"><use template="pane-actions" pane_id="2" /></if>
       <else><use template="leaf-pane-actions" pane_id="2" /></else>
-    </tabs>
+    </row>
     <separator />
     <if test="{secondary_has_tabs}">
       <use template="secondary-content" />
@@ -332,18 +338,21 @@
 
 <template name="tertiary-pane">
   <column grow="1" background="background" label="Tertiary tab panel">
-    <tabs height="28" padding="0" gap="1" background="surface" label="Tertiary tabs">
-      <for each="tertiaryTabs" key="id" as="tab">
-        <if test="{tab.selected}">
-          <use template="workspace-tab-active" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
-        </if>
-        <else>
-          <use template="workspace-tab-inactive" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
-        </else>
-      </for>
-      <spacer grow="1" />
+    <row height="28" background="surface">
+      <scroll grow="1" axis="horizontal">
+        <tabs height="28" padding="0" gap="1" label="Tertiary tabs">
+          <for each="tertiaryTabs" key="id" as="tab">
+            <if test="{tab.selected}">
+              <use template="workspace-tab-active" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
+            </if>
+            <else>
+              <use template="workspace-tab-inactive" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
+            </else>
+          </for>
+        </tabs>
+      </scroll>
       <use template="leaf-pane-actions" pane_id="3" />
-    </tabs>
+    </row>
     <separator />
     <if test="{tertiary_has_tabs}">
       <use template="tertiary-content" />
@@ -355,18 +364,21 @@
 
 <template name="quaternary-pane">
   <column grow="1" background="background" label="Quaternary tab panel">
-    <tabs height="28" padding="0" gap="1" background="surface" label="Quaternary tabs">
-      <for each="quaternaryTabs" key="id" as="tab">
-        <if test="{tab.selected}">
-          <use template="workspace-tab-active" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
-        </if>
-        <else>
-          <use template="workspace-tab-inactive" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
-        </else>
-      </for>
-      <spacer grow="1" />
+    <row height="28" background="surface">
+      <scroll grow="1" axis="horizontal">
+        <tabs height="28" padding="0" gap="1" label="Quaternary tabs">
+          <for each="quaternaryTabs" key="id" as="tab">
+            <if test="{tab.selected}">
+              <use template="workspace-tab-active" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
+            </if>
+            <else>
+              <use template="workspace-tab-inactive" title="{tab.title}" tab_id="{tab.id}" icon_name="{tab.icon}" dirty="{tab.dirty}" />
+            </else>
+          </for>
+        </tabs>
+      </scroll>
       <use template="leaf-pane-actions" pane_id="4" />
-    </tabs>
+    </row>
     <separator />
     <if test="{quaternary_has_tabs}">
       <use template="quaternary-content" />
