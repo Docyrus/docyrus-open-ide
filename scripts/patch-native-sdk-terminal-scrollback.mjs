@@ -300,5 +300,7 @@ for (const patch of patches) {
   }
   const original = patch.originals.find((candidate) => source.includes(candidate));
   if (original === undefined) throw new Error(patch.error);
-  writeFileSync(target, source.replace(original, patch.replacement));
+  // A replacement is literal text, never a replace() pattern: `$'`, `$&`,
+  // and `` $` `` all appear inside Zig character-class lists.
+  writeFileSync(target, source.replace(original, () => patch.replacement));
 }

@@ -326,7 +326,14 @@ async function openPath(path, options = {}) {
   lastOpenedPath = path;
   const ticket = setStatus(`Opening ${path}`);
   try {
-    await invoke("workspace.openPath", { path, edit: options.edit === true, line: options.line ?? 0 });
+    const result = await invoke("workspace.openPath", { path, edit: options.edit === true, line: options.line ?? 0 });
+    // The workspace answered with a dialog instead of a tab: the row stays
+    // un-opened so a second click can try again once the file changes.
+    if (result && result.opened === false) {
+      lastOpenedPath = "";
+      if (ticket === statusTicket) setStatus(`Cannot open ${basenameOf(path)}`, "error");
+      return;
+    }
     if (ticket === statusTicket) setStatus(path);
   } catch (error) {
     lastOpenedPath = "";
@@ -447,6 +454,15 @@ async function pasteEntry(targetPath) {
   await copyIntoFolder(source, destination, "Pasted to");
 }
 
+async function revealInFinder(path) {
+  try {
+    await invoke("workspace.revealPath", { path });
+    setStatus(`Revealed ${basenameOf(path)} in Finder`);
+  } catch (error) {
+    reportError(error, "Could not reveal this item in Finder");
+  }
+}
+
 async function copyPathToClipboard(path, absolute) {
   try {
     const copied = await invoke("workspace.copyPath", { path, absolute });
@@ -491,6 +507,8 @@ function contextMenuEntries(item) {
     { separator: true },
     { label: "Copy Path", run: () => copyPathToClipboard(path, true) },
     { label: "Copy Relative Path", run: () => copyPathToClipboard(path, false) },
+    { separator: true },
+    { label: "Reveal in Finder", run: () => revealInFinder(path) },
     { separator: true },
     { label: "Delete", destructive: true, handoff: true, run: () => deleteEntry(path) },
   ];

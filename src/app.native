@@ -598,6 +598,22 @@
     </dialog>
   </if>
 
+  <if test="{unsupported_file_open}">
+    <dialog label="Cannot open file" on-dismiss="close_unsupported_file">
+      <column width="480" height="200" padding="24" gap="18">
+        <column gap="6">
+          <text size="heading">Cannot open {unsupported_file_name}</text>
+          <text foreground="text_muted" wrap="true">{unsupported_file_message}</text>
+        </column>
+        <spacer grow="1" />
+        <row main="end" gap="8">
+          <button variant="secondary" on-press="reveal_unsupported_file">Reveal in Finder</button>
+          <button variant="primary" on-press="close_unsupported_file">OK</button>
+        </row>
+      </column>
+    </dialog>
+  </if>
+
   <if test="{settings_open}">
     <dialog label="Settings" on-dismiss="close_settings">
       <column width="480" height="236" padding="24" gap="18">

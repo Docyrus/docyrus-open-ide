@@ -67,7 +67,7 @@ const horizontal_split_min_pane_height: f32 = 140;
 const Pane = enum(u8) { primary = 1, secondary = 2, tertiary = 3, quaternary = 4 };
 const SplitMode = enum { horizontal, vertical };
 const ThemeMode = enum(u8) { system = 0, light = 1, dark = 2 };
-const FileKind = enum(u8) { code, markdown, image, text };
+const FileKind = enum(u8) { code, markdown, image, text, pdf };
 const ProjectKind = enum(u8) { folder, external_files };
 
 const system_open_view_label = "__docyrus_open_files__";
@@ -129,6 +129,9 @@ const DropFileMessage = struct {
     y: f32 = 0,
     viewWidth: f32 = 0,
     viewHeight: f32 = 0,
+    // Set when the editor cannot show this file. A terminal still takes the
+    // path as typing; a pane says why instead of opening a tab.
+    unsupported: UnsupportedReason = .none,
 };
 
 const PathMovedMessage = struct {
@@ -158,6 +161,15 @@ const EditorDirtyMessage = struct {
 const SystemOpenFileMessage = struct {
     path: []const u8,
     markdown: []const u8 = "",
+    // 1-based, from a `path:42` terminal link; 0 opens at the top.
+    line: u32 = 0,
+};
+
+// A file the workspace declined to open, named by its absolute path so the
+// dialog can offer to reveal it.
+const UnsupportedFileMessage = struct {
+    path: []const u8,
+    reason: UnsupportedReason,
 };
 
 const CloseIntent = enum(u8) { none, single, others, all };
@@ -254,6 +266,10 @@ const LayoutState = struct {
     term_scrollback: [max_terminals]u32 = [_]u32{0} ** max_terminals,
     term_started: [max_terminals]bool = [_]bool{false} ** max_terminals,
     term_live: [max_terminals]bool = [_]bool{false} ** max_terminals,
+    // The activation counter each terminal's `on-terminal` last reported. A
+    // clicked link rides the view state, which keeps arriving unchanged as the
+    // pane scrolls, so the watermark is what makes one click open one thing.
+    term_link_seq: [max_terminals]u32 = [_]u32{0} ** max_terminals,
 };
 
 const ExternalFile = struct {
@@ -350,8 +366,15 @@ pub const Model = struct {
         "pending_close_pane",
         "pending_close_intent",
         "pending_editor_action",
+        "unsupported_file_reason",
+        "unsupported_file_path_buffer",
+        "unsupported_file_path_len",
         "project_switching",
         "directory_picker_requested",
+        "terminal_open_requested",
+        "terminal_open_line",
+        "terminal_open_path_buffer",
+        "terminal_open_path_len",
         "drag_active",
         "project_drag_active",
         "project_menu_open",
@@ -408,6 +431,13 @@ pub const Model = struct {
     rename_project_id: u32 = 0,
     rename_project_buffer: canvas.TextBuffer(title_capacity) = .{},
     close_confirmation_open: bool = false,
+    // The file the workspace declined to open, and why. Held on the model so
+    // the dialog is the same one wherever the open came from -- the explorer,
+    // a drag, a terminal link, or Finder.
+    unsupported_file_open: bool = false,
+    unsupported_file_reason: UnsupportedReason = .none,
+    unsupported_file_path_buffer: [project_path_capacity]u8 = undefined,
+    unsupported_file_path_len: usize = 0,
     pending_close_project_id: u32 = 0,
     pending_close_tab_id: u8 = 0,
     pending_close_source_id: u8 = 0,
@@ -416,6 +446,12 @@ pub const Model = struct {
     pending_editor_action: EditorAction = .none,
     project_switching: bool = false,
     directory_picker_requested: bool = false,
+    // A terminal link the model resolved to an absolute path. Only the host may
+    // ask the filesystem whether it exists, so the request waits here for it.
+    terminal_open_requested: bool = false,
+    terminal_open_line: u32 = 0,
+    terminal_open_path_buffer: [project_path_capacity]u8 = undefined,
+    terminal_open_path_len: usize = 0,
     drag_active: bool = false,
     project_drag_active: bool = false,
     primary_reload_token: u64 = 0,
@@ -856,6 +892,22 @@ pub const Model = struct {
         return model.theme_mode == .dark;
     }
 
+    fn unsupportedFilePath(model: *const Model) []const u8 {
+        return model.unsupported_file_path_buffer[0..model.unsupported_file_path_len];
+    }
+
+    pub fn unsupported_file_name(model: *const Model) []const u8 {
+        const path = model.unsupportedFilePath();
+        return if (path.len == 0) "this file" else std.fs.path.basename(path);
+    }
+
+    pub fn unsupported_file_message(model: *const Model) []const u8 {
+        return switch (model.unsupported_file_reason) {
+            .too_large => "This file is larger than the editor can load. Open it in another application instead.",
+            else => "This file is not text, so there is nothing the editor or the preview can show. Open it in another application instead.",
+        };
+    }
+
     fn findProject(model: *const Model, path: []const u8) ?usize {
         for (model.projects[0..model.project_count], 0..) |*project, index| {
             if (project.kind == .folder and std.mem.eql(u8, project.path(), path)) return index;
@@ -887,6 +939,8 @@ pub const Msg = union(enum) {
         "markdown_saved",
         "editor_dirty_changed",
         "editor_discarded",
+        "show_unsupported_file",
+        "reveal_path",
         "toggle_markdown_editor",
         "toggle_markdown_preview",
         "finish_project_switch",
@@ -963,6 +1017,10 @@ pub const Msg = union(enum) {
     path_moved: PathMovedMessage,
     path_deleted: PathDeletedMessage,
     copy_text: []const u8,
+    reveal_path: []const u8,
+    show_unsupported_file: UnsupportedFileMessage,
+    close_unsupported_file,
+    reveal_unsupported_file,
     markdown_saved: MarkdownSavedMessage,
     editor_dirty_changed: EditorDirtyMessage,
     editor_discarded,
@@ -1003,9 +1061,49 @@ fn fileKind(path: []const u8) FileKind {
     if (std.ascii.eqlIgnoreCase(extension, ".md") or std.ascii.eqlIgnoreCase(extension, ".markdown")) return .markdown;
     const image_extensions = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp" };
     for (image_extensions) |candidate| if (std.ascii.eqlIgnoreCase(extension, candidate)) return .image;
+    // The WebView's own viewer renders these; nothing here reads their bytes.
+    if (std.ascii.eqlIgnoreCase(extension, ".pdf")) return .pdf;
     const text_extensions = [_][]const u8{ ".txt", ".log", ".csv", ".tsv" };
     for (text_extensions) |candidate| if (std.ascii.eqlIgnoreCase(extension, candidate)) return .text;
     return .code;
+}
+
+/// Why the workspace declined to open a file. `binary` is the common one: a
+/// PDF, an archive, a compiled binary -- Monaco would render mojibake and the
+/// tab would be worse than no tab at all.
+const UnsupportedReason = enum(u8) { none, binary, too_large };
+
+/// Files are probed by CONTENT, not by extension. The app claims a few hundred
+/// extensions as an editor and everything unclaimed still falls through to
+/// `.code`, so an extension list would be a second, always-stale copy of the
+/// truth; a NUL byte or invalid UTF-8 in the first pages is the actual reason
+/// the editor cannot show a file, whatever it is called. Unreadable files
+/// answer `none` -- the open path reports that failure in its own words.
+fn openRefusal(io: std.Io, absolute: []const u8, kind: FileKind) UnsupportedReason {
+    // An image is a bitmap the preview decodes and a PDF is one the WebView
+    // renders; neither is text, and each viewer answers for a file it cannot
+    // read in its own words.
+    if (kind == .image or kind == .pdf) return .none;
+    const stat = std.Io.Dir.cwd().statFile(io, absolute, .{}) catch return .none;
+    if (stat.kind != .file) return .none;
+    if (stat.size > bridge_file_limit) return .too_large;
+    var probe: [4096]u8 = undefined;
+    const head = std.Io.Dir.cwd().readFile(io, absolute, &probe) catch return .none;
+    return if (looksBinary(head)) .binary else .none;
+}
+
+fn looksBinary(head: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, head, 0) != null) return true;
+    var index: usize = 0;
+    while (index < head.len) {
+        const length = std.unicode.utf8ByteSequenceLength(head[index]) catch return true;
+        // The probe ends mid-codepoint on any file longer than it, and a cut
+        // sequence is a boundary artefact, not evidence of binary.
+        if (index + length > head.len) break;
+        _ = std.unicode.utf8Decode(head[index .. index + length]) catch return true;
+        index += length;
+    }
+    return false;
 }
 
 fn themeName(mode: ThemeMode) []const u8 {
@@ -1047,6 +1145,7 @@ fn tabIcon(layout: *const LayoutState, id: u32) []const u8 {
         .image => "image",
         .markdown => "file-text",
         .code => "code",
+        .pdf => "file-text",
         .text => "file",
     };
     if (terminalIndexForTab(id) != null) return "terminal";
@@ -1158,7 +1257,14 @@ fn statusText(model: *const Model, pane: Pane, arena: std.mem.Allocator) []const
         const live = layout.term_live[terminal_index];
         return std.fmt.allocPrint(arena, "{s}  |  {s}", .{ model.workspace_path(), if (live) "terminal connected" else "terminal starting" }) catch "Terminal";
     }
-    return std.fmt.allocPrint(arena, "{s}  |  UTF-8", .{tabTitle(layout, id)}) catch "Docyrus Open IDE";
+    // Nothing in a PDF or an image pane is text this app decoded, so naming an
+    // encoding there would be a claim the workspace cannot make.
+    const encoding: []const u8 = switch (layout.file_tabs[id - 1].kind) {
+        .pdf => "PDF document",
+        .image => "image",
+        else => "UTF-8",
+    };
+    return std.fmt.allocPrint(arena, "{s}  |  {s}", .{ tabTitle(layout, id), encoding }) catch "Docyrus Open IDE";
 }
 
 fn normalizeProjectPath(path: []const u8) []const u8 {
@@ -1284,7 +1390,7 @@ fn openSystemFile(model: *Model, message: SystemOpenFileMessage, fx: *Effects) v
         const project = &model.projects[project_id - 1];
         const relative = message.path[project.path().len + 1 ..];
         if (model.active_project_id != project_id) selectProject(model, project_id);
-        openFile(model, .{ .project_id = project_id, .path = relative, .markdown = message.markdown }, fx);
+        openFile(model, .{ .project_id = project_id, .path = relative, .markdown = message.markdown, .line = message.line }, fx);
         return;
     }
 
@@ -1294,7 +1400,7 @@ fn openSystemFile(model: *Model, message: SystemOpenFileMessage, fx: *Effects) v
     model.directory_picker_requested = false;
     if (model.active_project_id != project_id) selectProject(model, project_id);
     model.tree_reload_token +%= 1;
-    openFile(model, .{ .project_id = project_id, .path = message.path, .markdown = message.markdown }, fx);
+    openFile(model, .{ .project_id = project_id, .path = message.path, .markdown = message.markdown, .line = message.line }, fx);
 }
 
 fn selectProject(model: *Model, project_id: u32) void {
@@ -1468,22 +1574,54 @@ fn paneRevealLine(model: *const Model, pane: Pane) u32 {
     return layout.file_tabs[slot].reveal_line;
 }
 
+/// The pane order the preview slot table is published in, so a slot number in
+/// a `~preview` URL and a row in that table always name the same pane.
+const preview_panes = [_]Pane{ .primary, .secondary, .tertiary, .quaternary };
+
+fn previewSlotForPane(pane: Pane) usize {
+    for (preview_panes, 0..) |candidate, index| if (candidate == pane) return index;
+    unreachable;
+}
+
+/// A pane showing a PDF points its WebView at the FILE rather than at the
+/// Monaco page: WebKit has a real PDF viewer and it engages for a top-level
+/// `application/pdf` document, so scrolling, zoom, search, and selection all
+/// come for free and nothing has to read the bytes. The URL names a slot, not
+/// a path -- the host resolves it through the table `publishPreviewFiles`
+/// keeps -- and the reveal token makes it change when the pane's file does.
+fn paneWebUrl(model: *Model, pane: Pane, buffer: []u8) []const u8 {
+    if (paneFileKind(model, pane) == .pdf) {
+        return std.fmt.bufPrint(buffer, "zero://app/~preview/{d}?v={d}", .{
+            previewSlotForPane(pane),
+            paneActive(model, pane),
+        }) catch "";
+    }
+    return std.fmt.bufPrint(buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}&line={d}", .{
+        model.active_project_id,
+        paneActive(model, pane),
+        themeName(model.theme_mode),
+        paneRevealLine(model, pane),
+    }) catch "";
+}
+
 fn syncUrls(model: *Model) void {
     const theme = themeName(model.theme_mode);
-    const primary_slot = paneActive(model, .primary);
-    const secondary_slot = paneActive(model, .secondary);
-    const tertiary_slot = paneActive(model, .tertiary);
-    const quaternary_slot = paneActive(model, .quaternary);
-    const primary = std.fmt.bufPrint(&model.primary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}&line={d}", .{ model.active_project_id, primary_slot, theme, paneRevealLine(model, .primary) }) catch "";
-    model.primary_url_len = primary.len;
-    const secondary = std.fmt.bufPrint(&model.secondary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}&line={d}", .{ model.active_project_id, secondary_slot, theme, paneRevealLine(model, .secondary) }) catch "";
-    model.secondary_url_len = secondary.len;
-    const tertiary = std.fmt.bufPrint(&model.tertiary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}&line={d}", .{ model.active_project_id, tertiary_slot, theme, paneRevealLine(model, .tertiary) }) catch "";
-    model.tertiary_url_len = tertiary.len;
-    const quaternary = std.fmt.bufPrint(&model.quaternary_url_buffer, "zero://app/index.html?project={d}&slot={d}&theme={s}&line={d}", .{ model.active_project_id, quaternary_slot, theme, paneRevealLine(model, .quaternary) }) catch "";
-    model.quaternary_url_len = quaternary.len;
+    model.primary_url_len = paneWebUrl(model, .primary, &model.primary_url_buffer).len;
+    model.secondary_url_len = paneWebUrl(model, .secondary, &model.secondary_url_buffer).len;
+    model.tertiary_url_len = paneWebUrl(model, .tertiary, &model.tertiary_url_buffer).len;
+    model.quaternary_url_len = paneWebUrl(model, .quaternary, &model.quaternary_url_buffer).len;
     const tree = std.fmt.bufPrint(&model.tree_url_buffer, "zero://app/tree.html?project={d}&theme={s}", .{ model.active_project_id, theme }) catch "";
     model.tree_url_len = tree.len;
+}
+
+/// The absolute path a pane is previewing in its WebView, or empty when it is
+/// not showing one. This is what the host publishes as that pane's slot.
+fn panePreviewPath(model: *Model, pane: Pane) []const u8 {
+    if (paneFileKind(model, pane) != .pdf) return "";
+    const layout = model.activeLayoutConst() orelse return "";
+    const id = layout.pane_active_tabs[paneIndex(pane)];
+    if (id < 1 or id > max_file_tabs) return "";
+    return fullPathForTab(model, id);
 }
 
 fn insertTabRaw(layout: *LayoutState, pane: Pane, id: u8, requested_index: usize) void {
@@ -2017,10 +2155,79 @@ fn paneTerminalScrollback(model: *const Model, pane: Pane) u32 {
 
 /// A pane's `on-terminal` reports for whichever terminal that pane was showing
 /// when the layout was built, so the scrollback lands on the active one.
-fn applyTerminalState(model: *Model, pane: Pane, state: canvas.TerminalState) void {
+fn applyTerminalState(model: *Model, pane: Pane, state: canvas.TerminalState, fx: *Effects) void {
     const layout = model.activeLayout() orelse return;
     const index = paneTerminalIndex(layout, pane) orelse return;
     layout.term_scrollback[index] = state.scrollback;
+    // The clicked link rides the same view state, and that state keeps
+    // arriving as the pane scrolls: only a MOVED activation counter is a new
+    // click, so the watermark is what stops one click opening twice.
+    if (state.link_kind == .none or state.link_seq == layout.term_link_seq[index]) return;
+    layout.term_link_seq[index] = state.link_seq;
+    openTerminalLink(model, state, fx);
+}
+
+// A link the terminal reported as clicked. A web URL leaves for the system
+// browser; a path is resolved here and opened in a pane, because opening a
+// file the workspace already knows how to show is the whole point of clicking
+// one in an IDE's terminal.
+fn openTerminalLink(model: *Model, state: canvas.TerminalState, fx: *Effects) void {
+    const target = state.linkTarget();
+    if (target.len == 0) return;
+    switch (state.link_kind) {
+        .none => {},
+        .url => {
+            if (std.mem.startsWith(u8, target, "http://") or std.mem.startsWith(u8, target, "https://")) {
+                fx.hostSend("native-sdk.os.openUrl", target);
+                return;
+            }
+            // A bare `www.` host: the runtime only opens http(s), so name the
+            // scheme the browser would have assumed anyway.
+            var buffer: [canvas.max_terminal_link_bytes + "https://".len]u8 = undefined;
+            const url = std.fmt.bufPrint(&buffer, "https://{s}", .{target}) catch return;
+            fx.hostSend("native-sdk.os.openUrl", url);
+        },
+        .path => requestTerminalFileOpen(model, target, state.link_line),
+    }
+}
+
+fn requestTerminalFileOpen(model: *Model, target: []const u8, line: u32) void {
+    var buffer: [project_path_capacity]u8 = undefined;
+    const absolute = resolveTerminalPath(model, target, &buffer) orelse return;
+    if (absolute.len > model.terminal_open_path_buffer.len) return;
+    model.terminal_open_path_len = absolute.len;
+    @memcpy(model.terminal_open_path_buffer[0..absolute.len], absolute);
+    model.terminal_open_line = line;
+    model.terminal_open_requested = true;
+}
+
+// A terminal prints paths relative to the SHELL's working directory, which the
+// model cannot observe -- the pty is a child with a life of its own. The
+// project folder is the honest stand-in: it is where the shell started, and it
+// is the only root this workspace can open a file under. `~` still means home,
+// and an absolute path needs no root at all.
+fn resolveTerminalPath(model: *const Model, target: []const u8, buffer: []u8) ?[]const u8 {
+    if (target.len == 0 or std.mem.indexOfScalar(u8, target, 0) != null) return null;
+    if (std.fs.path.isAbsolute(target)) return target;
+    if (std.mem.startsWith(u8, target, "~/")) {
+        const home = model.homePath();
+        if (home.len == 0) return null;
+        return std.fmt.bufPrint(buffer, "{s}/{s}", .{ home, target[2..] }) catch null;
+    }
+    const project = model.activeProjectConst() orelse return null;
+    if (project.kind != .folder) return null;
+    const relative = if (std.mem.startsWith(u8, target, "./")) target[2..] else target;
+    // `..` would climb out of the project, and the string would no longer
+    // match the prefix every "which project owns this file" check uses.
+    if (!isSafeRelativePath(relative)) return null;
+    return std.fmt.bufPrint(buffer, "{s}/{s}", .{ project.path(), relative }) catch null;
+}
+
+fn showUnsupportedFile(model: *Model, path: []const u8, reason: UnsupportedReason) void {
+    model.unsupported_file_path_len = @min(path.len, model.unsupported_file_path_buffer.len);
+    @memcpy(model.unsupported_file_path_buffer[0..model.unsupported_file_path_len], path[0..model.unsupported_file_path_len]);
+    model.unsupported_file_reason = reason;
+    model.unsupported_file_open = true;
 }
 
 fn needsShellQuoting(path: []const u8) bool {
@@ -2078,6 +2285,10 @@ fn dropFile(model: *Model, message: DropFileMessage, fx: *Effects) void {
             pasteIntoTerminal(model, terminal_index, message.absolute, fx);
             return;
         }
+    }
+    if (message.unsupported != .none) {
+        showUnsupportedFile(model, message.absolute, message.unsupported);
+        return;
     }
     openFileInPane(model, .{
         .project_id = message.project_id,
@@ -2227,9 +2438,14 @@ fn fullPathForTab(model: *Model, id: u32) []const u8 {
     if (terminalIndexForTab(id) != null) return project.path();
     const layout = &project.layout;
     if (id < 1 or id > max_file_tabs or !layout.file_tabs[id - 1].used) return project.path();
+    // `fullPath` only WRITES the scratch for a folder project; for the
+    // external-files project an absolute tab path is already the answer and
+    // comes back untouched. Returning the scratch either way handed those
+    // tabs whatever bytes the buffer happened to hold -- so return what
+    // `fullPath` actually resolved. Both slices outlive this call.
     const value = fullPath(project, layout.file_tabs[id - 1].path(), &model.path_scratch) catch return project.path();
     model.path_scratch_len = value.len;
-    return model.path_scratch[0..model.path_scratch_len];
+    return value;
 }
 
 fn relativePathForTab(model: *const Model, id: u32) []const u8 {
@@ -2327,10 +2543,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .image_loaded => |result| if (result.id == model.preview_image_request and result.outcome == .loaded) {
             model.preview_image = result.id;
         },
-        .primary_term_state => |state| applyTerminalState(model, .primary, state),
-        .secondary_term_state => |state| applyTerminalState(model, .secondary, state),
-        .tertiary_term_state => |state| applyTerminalState(model, .tertiary, state),
-        .quaternary_term_state => |state| applyTerminalState(model, .quaternary, state),
+        .primary_term_state => |state| applyTerminalState(model, .primary, state, fx),
+        .secondary_term_state => |state| applyTerminalState(model, .secondary, state, fx),
+        .tertiary_term_state => |state| applyTerminalState(model, .tertiary, state, fx),
+        .quaternary_term_state => |state| applyTerminalState(model, .quaternary, state, fx),
         .project_sidebar_resized => |fraction| {
             model.project_sidebar_fraction = std.math.clamp(fraction, 0.11, 0.28);
         },
@@ -2371,6 +2587,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .copy_path => |id| copyTabPath(model, id, true, fx),
         .copy_relative_path => |id| copyTabPath(model, id, false, fx),
         .reveal_in_finder => |id| fx.hostSend("native-sdk.os.revealPath", fullPathForTab(model, id)),
+        .reveal_path => |path| fx.hostSend("native-sdk.os.revealPath", path),
+        .show_unsupported_file => |message| showUnsupportedFile(model, message.path, message.reason),
+        .close_unsupported_file => model.unsupported_file_open = false,
+        .reveal_unsupported_file => {
+            const path = model.unsupportedFilePath();
+            if (path.len > 0) fx.hostSend("native-sdk.os.revealPath", path);
+            model.unsupported_file_open = false;
+        },
         .open_terminal_in => |pane_id| openTerminalIn(model, pane_id, fx),
         .split_horizontal => |pane_id| setSplit(model, pane_id, .horizontal),
         .split_vertical => |pane_id| setSplit(model, pane_id, .vertical),
@@ -3489,6 +3713,183 @@ test "a file dropped into a terminal is typed as a quoted path" {
     try std.testing.expectEqualStrings("/tmp/project/two.zig ", fx.ptyWrittenBytes(terminalKey(1, 0)));
 }
 
+fn terminalLink(seq: u32, kind: canvas.TerminalLinkKind, target: []const u8, line: u32) canvas.TerminalState {
+    var state: canvas.TerminalState = .{ .link_seq = seq, .link_kind = kind, .link_line = line };
+    state.link_len = @intCast(target.len);
+    @memcpy(state.link_bytes[0..target.len], target);
+    return state;
+}
+
+test "a terminal link resolves against the project, home, and absolute roots" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    model.setHomePath("/Users/tester");
+    var buffer: [project_path_capacity]u8 = undefined;
+
+    try std.testing.expectEqualStrings("/tmp/project/src/main.zig", resolveTerminalPath(&model, "src/main.zig", &buffer).?);
+    try std.testing.expectEqualStrings("/tmp/project/build.zig", resolveTerminalPath(&model, "./build.zig", &buffer).?);
+    try std.testing.expectEqualStrings("/Users/tester/.zshrc", resolveTerminalPath(&model, "~/.zshrc", &buffer).?);
+    try std.testing.expectEqualStrings("/etc/hosts", resolveTerminalPath(&model, "/etc/hosts", &buffer).?);
+
+    // Climbing out of the project would leave a path no "which project owns
+    // this file" check can match, so it resolves to nothing at all.
+    try std.testing.expectEqual(@as(?[]const u8, null), resolveTerminalPath(&model, "../elsewhere/x.zig", &buffer));
+}
+
+test "command-clicking a terminal path asks the host for it once per click" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    openTerminalIn(&model, 1, &fx);
+
+    applyTerminalState(&model, .primary, terminalLink(1, .path, "src/main.zig", 42), &fx);
+    try std.testing.expect(model.terminal_open_requested);
+    try std.testing.expectEqualStrings("/tmp/project/src/main.zig", model.terminal_open_path_buffer[0..model.terminal_open_path_len]);
+    try std.testing.expectEqual(@as(u32, 42), model.terminal_open_line);
+
+    // The same activation keeps riding every scroll report that follows; only
+    // a moved counter is a second click.
+    model.terminal_open_requested = false;
+    applyTerminalState(&model, .primary, terminalLink(1, .path, "src/main.zig", 42), &fx);
+    try std.testing.expect(!model.terminal_open_requested);
+    applyTerminalState(&model, .primary, terminalLink(2, .path, "README.md", 0), &fx);
+    try std.testing.expect(model.terminal_open_requested);
+    try std.testing.expectEqualStrings("/tmp/project/README.md", model.terminal_open_path_buffer[0..model.terminal_open_path_len]);
+    try std.testing.expectEqual(@as(u32, 0), model.terminal_open_line);
+
+    // A web link leaves for the system browser instead, so no file is asked for.
+    model.terminal_open_requested = false;
+    applyTerminalState(&model, .primary, terminalLink(3, .url, "https://example.com/docs", 0), &fx);
+    try std.testing.expect(!model.terminal_open_requested);
+}
+
+test "the host opens a terminal link at the line it named" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // What the host dispatches once the path turns out to be a real file.
+    update(&model, .{ .open_system_file = .{ .path = "/tmp/project/src/main.zig", .line = 42 } }, &fx);
+    try std.testing.expect(std.mem.endsWith(u8, model.primaryEditorUrl(), "&line=42"));
+}
+
+test "a file the editor cannot show is judged by its bytes, not its name" {
+    // Text, including a partial codepoint cut by the probe's end.
+    try std.testing.expect(!looksBinary("const std = @import(\"std\");\n"));
+    try std.testing.expect(!looksBinary("merhaba d\xc3\xbcnya"));
+    try std.testing.expect(!looksBinary("\xc3"));
+    try std.testing.expect(!looksBinary(""));
+
+    // A NUL byte, and bytes that are no encoding at all.
+    try std.testing.expect(looksBinary("%PDF-1.7\x00\x01binary"));
+    try std.testing.expect(looksBinary("\x89PNG\r\n\x1a\n"));
+    try std.testing.expect(looksBinary("\xff\xfe\xfd"));
+}
+
+test "an unsupported file explains itself instead of opening a tab" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    update(&model, .{ .show_unsupported_file = .{ .path = "/tmp/project/design.pdf", .reason = .binary } }, &fx);
+    try std.testing.expect(model.unsupported_file_open);
+    try std.testing.expectEqualStrings("design.pdf", model.unsupported_file_name());
+    try std.testing.expect(std.mem.startsWith(u8, model.unsupported_file_message(), "This file is not text"));
+    // No tab was spent on a file nothing can show.
+    try std.testing.expectEqual(@as(?Pane, null), paneForTab(model.activeLayout().?, 1));
+
+    update(&model, .{ .close_unsupported_file = {} }, &fx);
+    try std.testing.expect(!model.unsupported_file_open);
+
+    update(&model, .{ .show_unsupported_file = .{ .path = "/tmp/project/dump.sql", .reason = .too_large } }, &fx);
+    try std.testing.expect(std.mem.startsWith(u8, model.unsupported_file_message(), "This file is larger"));
+    // Revealing it is the way out of the dialog, so it closes behind itself.
+    update(&model, .{ .reveal_unsupported_file = {} }, &fx);
+    try std.testing.expect(!model.unsupported_file_open);
+}
+
+test "dropping an unsupported file onto a pane explains, onto a terminal types" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    var drop = explorerDrop(&model, 700, 400, "design.pdf", "/tmp/project/design.pdf");
+    drop.unsupported = .binary;
+    dropFile(&model, drop, &fx);
+    try std.testing.expect(model.unsupported_file_open);
+    try std.testing.expectEqual(@as(?Pane, null), paneForTab(model.activeLayout().?, 1));
+
+    // A terminal takes the path as typing -- nothing has to read the file --
+    // so the same drop over one still lands.
+    update(&model, .{ .close_unsupported_file = {} }, &fx);
+    openTerminalIn(&model, 1, &fx);
+    dropFile(&model, drop, &fx);
+    try std.testing.expect(!model.unsupported_file_open);
+    try std.testing.expectEqualStrings("/tmp/project/design.pdf ", fx.ptyWrittenBytes(terminalKey(1, 0)));
+}
+
+test "a PDF pane points its WebView at the file and publishes the slot" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    openFile(&model, .{ .project_id = 1, .path = "docs/spec.pdf" }, &fx);
+    try std.testing.expectEqual(FileKind.pdf, model.activeLayout().?.file_tabs[0].kind);
+    // Slot 0 is the primary pane; the token changes with the pane's tab so the
+    // WebView renavigates instead of showing the file it had.
+    try std.testing.expectEqualStrings("zero://app/~preview/0?v=1", model.primaryEditorUrl());
+    try std.testing.expectEqualStrings("/tmp/project/docs/spec.pdf", panePreviewPath(&model, .primary));
+    try std.testing.expectEqualStrings("", panePreviewPath(&model, .secondary));
+
+    // A text tab in the same pane goes back to the Monaco page, and the slot
+    // closes behind it.
+    openFile(&model, .{ .project_id = 1, .path = "src/main.zig" }, &fx);
+    try std.testing.expect(std.mem.startsWith(u8, model.primaryEditorUrl(), "zero://app/index.html?"));
+    try std.testing.expectEqualStrings("", panePreviewPath(&model, .primary));
+}
+
+test "a PDF is previewable, so it is never refused as unsupported" {
+    try std.testing.expectEqual(FileKind.pdf, fileKind("docs/spec.pdf"));
+    try std.testing.expectEqual(FileKind.pdf, fileKind("SPEC.PDF"));
+    // The refusal probe reads bytes for everything it does not hand to a
+    // viewer of its own, and a PDF's bytes would always read as binary.
+    try std.testing.expect(looksBinary("%PDF-1.7\x00stream"));
+}
+
+test "an absolute tab path survives the scratch buffer it never used" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    // A file outside every project joins the external-files project, where the
+    // tab path is ALREADY absolute -- `fullPath` returns it untouched rather
+    // than writing the scratch, so the answer must be that slice and not
+    // whatever the scratch happened to hold.
+    openSystemFile(&model, .{ .path = "/tmp/outside/report.pdf" }, &fx);
+    const layout = model.activeLayout().?;
+    const id = layout.pane_active_tabs[paneIndex(.primary)];
+    try std.testing.expectEqualStrings("/tmp/outside/report.pdf", fullPathForTab(&model, id));
+    try std.testing.expectEqualStrings("/tmp/outside/report.pdf", panePreviewPath(&model, .primary));
+}
+
 test "the pane terminal button always opens a new terminal" {
     var model: Model = .{};
     model.active_project_id = addProject(&model, "/tmp/project").?;
@@ -3856,6 +4257,14 @@ pub fn appOptions(_: std.Io) DocyrusApp.Options {
     };
 }
 
+/// The answer every open-shaped bridge command gives the File Explorer: it
+/// asked for a file and either got a tab or got the dialog.
+fn writeOpenedJson(output: []u8, opened: bool) ![]const u8 {
+    var writer: std.Io.Writer = .fixed(output);
+    try std.json.Stringify.value(.{ .opened = opened }, .{}, &writer);
+    return writer.buffered();
+}
+
 const BridgePath = struct {
     path: []const u8,
     edit: bool = false,
@@ -3930,6 +4339,9 @@ const AppHost = struct {
     preferences_signature: u64 = 0,
     session_signature: u64 = 0,
     persisted_at_ns: i96 = 0,
+    // Hash of the last preview slot table handed to the host, so an unchanged
+    // table is not republished on every platform event.
+    preview_files_signature: u64 = 0,
 
     fn queueOpenFile(self: *AppHost, path: []const u8) void {
         if (!std.fs.path.isAbsolute(path) or path.len > project_path_capacity or self.pending_open_file_count >= max_pending_open_files) return;
@@ -3961,9 +4373,14 @@ const AppHost = struct {
             return err;
         };
         for (self.pending_open_files[0..self.pending_open_file_count]) |*pending| {
-            try self.dispatchSystemOpen(runtime, 1, pending.path());
+            try self.dispatchSystemOpen(runtime, 1, pending.path(), 0);
         }
         self.pending_open_file_count = 0;
+        // A restored or command-line PDF pane already asked its WebView to
+        // navigate; WebKit delivers that scheme task on a later runloop turn,
+        // so publishing here still beats it to the slot table. Without this,
+        // boot is the one pane change that never passes through `eventFn`.
+        self.publishPreviewFiles();
     }
 
     fn eventFn(context: *anyopaque, runtime: *native_sdk.Runtime, event: native_sdk.Event) anyerror!void {
@@ -3971,24 +4388,75 @@ const AppHost = struct {
         try self.base.event(runtime, event);
         switch (event) {
             .files_dropped => |drop| if (std.mem.eql(u8, drop.view_label, system_open_view_label)) {
-                for (drop.paths) |path| try self.dispatchSystemOpen(runtime, drop.window_id, path);
+                for (drop.paths) |path| try self.dispatchSystemOpen(runtime, drop.window_id, path, 0);
             },
             else => {},
         }
+        self.publishPreviewFiles();
+        if (self.ui.model.terminal_open_requested) try self.openTerminalLinkPath(runtime);
         if (self.ui.model.directory_picker_requested) try self.showDirectoryPicker(runtime);
         if (self.ui.model.project_switching) try self.ui.dispatch(runtime, 1, .finish_project_switch);
         self.persistState(false);
     }
 
-    fn dispatchSystemOpen(self: *AppHost, runtime: *native_sdk.Runtime, window_id: u64, path: []const u8) !void {
+    fn dispatchSystemOpen(self: *AppHost, runtime: *native_sdk.Runtime, window_id: u64, path: []const u8, line: u32) !void {
         if (!std.fs.path.isAbsolute(path) or std.mem.indexOfScalar(u8, path, 0) != null) return;
+        const refusal = openRefusal(self.io, path, fileKind(path));
+        if (refusal != .none) {
+            try self.ui.dispatch(runtime, window_id, .{ .show_unsupported_file = .{ .path = path, .reason = refusal } });
+            return;
+        }
         var markdown: []u8 = &.{};
         if (fileKind(path) == .markdown) {
             markdown = std.Io.Dir.cwd().readFileAlloc(self.io, path, std.heap.page_allocator, .limited(markdown_capacity)) catch &.{};
         }
         defer if (markdown.len > 0) std.heap.page_allocator.free(markdown);
-        try self.ui.dispatch(runtime, window_id, .{ .open_system_file = .{ .path = path, .markdown = markdown } });
+        try self.ui.dispatch(runtime, window_id, .{ .open_system_file = .{ .path = path, .markdown = markdown, .line = line } });
         if (self.ui.model.project_switching) try self.ui.dispatch(runtime, window_id, .finish_project_switch);
+    }
+
+/// Hand the macOS host the files `zero://app/~preview/<slot>` may serve, one
+/// line per pane in `preview_panes` order. The host holds no root and does no
+/// path parsing: a slot resolves through this table or it resolves to nothing,
+/// so a WebView reaches exactly the files the user has open in a pane and the
+/// door closes the moment a tab does.
+extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) void;
+
+    fn publishPreviewFiles(self: *AppHost) void {
+        if (comptime builtin.os.tag != .macos) return;
+        var buffer: [preview_panes.len * (project_path_capacity + 1)]u8 = undefined;
+        var writer: std.Io.Writer = .fixed(&buffer);
+        for (preview_panes, 0..) |pane, index| {
+            if (index > 0) writer.writeByte('\n') catch return;
+            writer.writeAll(panePreviewPath(&self.ui.model, pane)) catch return;
+        }
+        const published = writer.buffered();
+        // Republishing an unchanged table would hand the host the same strings
+        // on every platform event; the signature keeps it to real changes.
+        const signature = std.hash.Wyhash.hash(0, published);
+        if (self.preview_files_signature == signature) return;
+        self.preview_files_signature = signature;
+        native_sdk_appkit_set_preview_files(published.ptr, published.len);
+    }
+
+    /// Service a link clicked in a terminal pane. The model resolved the path;
+    /// this is the layer allowed to ask the filesystem whether it names a file
+    /// worth opening, and a path that does not -- a stale build log, a
+    /// directory, a word that merely looked like one -- drops silently, because
+    /// the click named nothing to open.
+    fn openTerminalLinkPath(self: *AppHost, runtime: *native_sdk.Runtime) anyerror!void {
+        self.ui.model.terminal_open_requested = false;
+        const line = self.ui.model.terminal_open_line;
+        // The dispatch below runs `update`, which owns the model's buffers, so
+        // the path travels on this stack rather than as a slice into them.
+        var storage: [project_path_capacity]u8 = undefined;
+        const length = self.ui.model.terminal_open_path_len;
+        if (length == 0 or length > storage.len) return;
+        @memcpy(storage[0..length], self.ui.model.terminal_open_path_buffer[0..length]);
+        const path = storage[0..length];
+        const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return;
+        if (stat.kind != .file) return;
+        try self.dispatchSystemOpen(runtime, 1, path, line);
     }
 
     fn sceneFn(context: *anyopaque) anyerror!native_sdk.ShellConfig {
@@ -4116,12 +4584,19 @@ const AppHost = struct {
         else
             parsed.value.path;
         const absolute = try fullPath(project, open_path, &absolute_buffer);
+        const runtime = self.runtime orelse return error.RuntimeNotReady;
+        // A tab full of mojibake is worse than no tab: refuse before one is
+        // opened and let the dialog say why.
+        const refusal = openRefusal(self.io, absolute, fileKind(open_path));
+        if (refusal != .none) {
+            try self.ui.dispatch(runtime, invocation.source.window_id, .{ .show_unsupported_file = .{ .path = absolute, .reason = refusal } });
+            return writeOpenedJson(output, false);
+        }
         var markdown: []u8 = &.{};
         if (fileKind(open_path) == .markdown) {
             markdown = std.Io.Dir.cwd().readFileAlloc(self.io, absolute, std.heap.page_allocator, .limited(markdown_capacity)) catch &.{};
         }
         defer if (markdown.len > 0) std.heap.page_allocator.free(markdown);
-        const runtime = self.runtime orelse return error.RuntimeNotReady;
         try self.ui.dispatch(runtime, invocation.source.window_id, .{ .open_file = .{
             .project_id = active.id,
             .path = open_path,
@@ -4129,9 +4604,7 @@ const AppHost = struct {
             .edit = parsed.value.edit,
             .line = parsed.value.line,
         } });
-        var writer: std.Io.Writer = .fixed(output);
-        try writer.writeAll("true");
-        return writer.buffered();
+        return writeOpenedJson(output, true);
     }
 
     fn dropPath(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -4148,12 +4621,15 @@ const AppHost = struct {
         else
             parsed.value.path;
         const absolute = try fullPath(project, open_path, &absolute_buffer);
+        const runtime = self.runtime orelse return error.RuntimeNotReady;
+        // A drop onto a terminal types the path and needs no reader, but a
+        // drop onto a pane opens a tab, so it answers to the same refusal.
+        const refusal = openRefusal(self.io, absolute, fileKind(open_path));
         var markdown: []u8 = &.{};
         if (fileKind(open_path) == .markdown) {
             markdown = std.Io.Dir.cwd().readFileAlloc(self.io, absolute, std.heap.page_allocator, .limited(markdown_capacity)) catch &.{};
         }
         defer if (markdown.len > 0) std.heap.page_allocator.free(markdown);
-        const runtime = self.runtime orelse return error.RuntimeNotReady;
         try self.ui.dispatch(runtime, invocation.source.window_id, .{ .drop_file = .{
             .project_id = active.id,
             .path = open_path,
@@ -4163,10 +4639,9 @@ const AppHost = struct {
             .y = parsed.value.y,
             .viewWidth = parsed.value.viewWidth,
             .viewHeight = parsed.value.viewHeight,
+            .unsupported = refusal,
         } });
-        var writer: std.Io.Writer = .fixed(output);
-        try writer.writeAll("true");
-        return writer.buffered();
+        return writeOpenedJson(output, refusal == .none);
     }
 
     fn treeProject(self: *AppHost, invocation: native_sdk.bridge.Invocation) !ActiveProject {
@@ -4253,6 +4728,25 @@ const AppHost = struct {
         return native_sdk.bridge.writeJsonStringValue(output, text);
     }
 
+    /// Reveal a File Explorer row in Finder. Folders reveal too, which is why
+    /// the tree path keeps its trailing slash until here.
+    fn revealPath(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
+        const self: *AppHost = @ptrCast(@alignCast(context));
+        if (!std.mem.eql(u8, invocation.source.webview_label, tree_view_label)) return error.InvalidBridgeSource;
+        const parsed = try std.json.parseFromSlice(BridgePath, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        if (!isSafeRelativePath(parsed.value.path)) return error.InvalidPath;
+        const active = try self.activeBridgeProject();
+        var absolute_buffer: [bridge_path_capacity]u8 = undefined;
+        const absolute = if (active.project.kind == .external_files)
+            (externalFileForTreeName(&self.ui.model, parsed.value.path) orelse return error.InvalidPath).path()
+        else
+            try fullPath(active.project, trimTreePath(parsed.value.path), &absolute_buffer);
+        const runtime = self.runtime orelse return error.RuntimeNotReady;
+        try self.ui.dispatch(runtime, invocation.source.window_id, .{ .reveal_path = absolute });
+        return native_sdk.bridge.writeJsonStringValue(output, absolute);
+    }
+
     fn searchFiles(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
         const self: *AppHost = @ptrCast(@alignCast(context));
         const parsed = try std.json.parseFromSlice(BridgeSearchRequest, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
@@ -4269,7 +4763,9 @@ const AppHost = struct {
         const project = try self.validateBridgeProject(parsed.value.projectId);
         if (parsed.value.slot < 1 or parsed.value.slot > max_file_tabs) return error.UnknownTab;
         const tab = &project.layout.file_tabs[parsed.value.slot - 1];
-        if (!tab.used) return error.UnknownTab;
+        // A PDF pane navigates to the file itself, so Monaco never asks for
+        // one; answering with its bytes would only be a way to get them wrong.
+        if (!tab.used or tab.kind == .pdf) return error.UnknownTab;
         var absolute_buffer: [2048]u8 = undefined;
         const absolute = try fullPath(project, tab.path(), &absolute_buffer);
         const content = try std.Io.Dir.cwd().readFileAlloc(self.io, absolute, std.heap.page_allocator, .limited(bridge_file_limit));
@@ -4288,7 +4784,7 @@ const AppHost = struct {
         const project = try self.validateBridgeProject(parsed.value.projectId);
         if (parsed.value.slot < 1 or parsed.value.slot > max_file_tabs) return error.UnknownTab;
         const tab = &project.layout.file_tabs[parsed.value.slot - 1];
-        if (!tab.used or tab.kind == .image) return error.UnknownTab;
+        if (!tab.used or tab.kind == .image or tab.kind == .pdf) return error.UnknownTab;
         var absolute_buffer: [2048]u8 = undefined;
         const absolute = try fullPath(project, tab.path(), &absolute_buffer);
         try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = absolute, .data = parsed.value.content });
@@ -5285,6 +5781,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "workspace.deletePath", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
         .{ .name = "workspace.copyEntry", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
         .{ .name = "workspace.copyPath", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
+        .{ .name = "workspace.revealPath", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
         .{ .name = "workspace.searchFiles", .permissions = &.{native_sdk.security.permission_filesystem}, .origins = &.{"zero://app"} },
     };
     const bridge_handlers = [_]native_sdk.bridge.Handler{
@@ -5302,6 +5799,7 @@ pub fn main(init: std.process.Init) !void {
         .{ .name = "workspace.deletePath", .context = &host, .invoke_fn = AppHost.deletePath },
         .{ .name = "workspace.copyEntry", .context = &host, .invoke_fn = AppHost.copyEntry },
         .{ .name = "workspace.copyPath", .context = &host, .invoke_fn = AppHost.copyPath },
+        .{ .name = "workspace.revealPath", .context = &host, .invoke_fn = AppHost.revealPath },
         .{ .name = "workspace.searchFiles", .context = &host, .invoke_fn = AppHost.searchFiles },
     };
 
@@ -5317,7 +5815,13 @@ pub fn main(init: std.process.Init) !void {
         },
         .security = .{
             .permissions = &app_permissions,
-            .navigation = .{ .allowed_origins = &.{ "zero://app", "zero://inline" }, .external_links = .{ .action = .deny } },
+            // The runtime reads THIS policy, not app.json's copy of it: a
+            // terminal link, and any external link in the Markdown preview,
+            // reaches the system browser only through an open-browser action.
+            .navigation = .{
+                .allowed_origins = &.{ "zero://app", "zero://inline" },
+                .external_links = .{ .action = .open_system_browser, .allowed_urls = &.{"*"} },
+            },
         },
     }, init);
 }
