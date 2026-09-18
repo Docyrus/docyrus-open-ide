@@ -2,9 +2,9 @@
 set -euo pipefail
 
 APP_NAME="Docyrus Open IDE"
-RELEASE_TAG="v0.1.9"
-ARCHIVE_NAME="Docyrus-Open-IDE-v0.1.9-macos-arm64.zip"
-EXPECTED_SHA256="56b5571e1805a3cd96afdd4b2d8ce7cc79dd033fc8fabc649129e5b15869c264"
+RELEASE_TAG="v0.1.10"
+ARCHIVE_NAME="Docyrus-Open-IDE-v0.1.10-macos-arm64.zip"
+EXPECTED_SHA256="41009ae1d7b41bb7b4e7a0d966353469b9a667fc6f275bf7ae50da5c7569c788"
 INSTALL_PATH="/Applications/${APP_NAME}.app"
 DOWNLOAD_URL="https://github.com/Docyrus/docyrus-open-ide/releases/download/${RELEASE_TAG}/${ARCHIVE_NAME}"
 
