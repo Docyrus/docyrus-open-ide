@@ -978,6 +978,7 @@ pub const Msg = union(enum) {
     open_terminal_in: u32,
     split_horizontal: u32,
     split_vertical: u32,
+    close_pane: u32,
     select_project: u32,
     hover_project: u32,
     leave_project: u32,
@@ -1826,6 +1827,7 @@ fn closeTabNow(model: *Model, id: u32, fx: *Effects) void {
     _ = removeTabRaw(layout, pane, index);
     syncPaneActive(layout, pane);
     collapseEmptyPane(layout, pane);
+    focusSurvivingPane(layout, pane);
     if (id <= max_file_tabs) layout.file_tabs[id - 1] = .{};
     bumpAllEditorReloads(model);
     syncUrls(model);
@@ -1869,6 +1871,7 @@ fn closeAllTabsInPane(model: *Model, pane: Pane, fx: *Effects) void {
     layout.pane_tab_counts[pane_index] = 0;
     layout.pane_active_tabs[pane_index] = 0;
     collapseEmptyPane(layout, pane);
+    focusSurvivingPane(layout, pane);
     bumpAllEditorReloads(model);
     syncUrls(model);
 }
@@ -2330,6 +2333,41 @@ fn setSplit(model: *Model, pane_id: u32, mode: SplitMode) void {
     }
 }
 
+/// A pane's Close button retires the whole panel. Tabs go first, through the
+/// same dirty-file confirmation "Close All" uses; a pane that never held a tab
+/// -- one that exists only because a split opened it -- collapses on the spot.
+/// The primary pane anchors the workspace and refuses to close. An empty
+/// secondary pane whose branch still holds quaternary tabs stays too: the
+/// layout has no shape for a quaternary pane without its secondary parent.
+fn closePane(model: *Model, pane_id: u32, fx: *Effects) void {
+    const layout = model.activeLayout() orelse return;
+    const pane = paneFromId(pane_id) orelse return;
+    if (pane == .primary) return;
+    if (paneCount(layout, pane) > 0) return requestCloseAllInPane(model, pane, fx);
+    collapseEmptyPane(layout, pane);
+    focusSurvivingPane(layout, pane);
+    syncUrls(model);
+}
+
+// A collapsed pane no longer renders, and an active_pane aimed at one quietly
+// reopens the panel on the next file open, so aim it at the pane that absorbed
+// the closed panel's space instead.
+fn focusSurvivingPane(layout: *LayoutState, closed: Pane) void {
+    if (layout.active_pane != closed) return;
+    const still_open = switch (closed) {
+        .primary => true,
+        .secondary => layout.secondary_panel_open,
+        .tertiary => layout.primary_child_open,
+        .quaternary => layout.secondary_child_open,
+    };
+    if (still_open) return;
+    layout.active_pane = switch (closed) {
+        .primary => .primary,
+        .secondary, .tertiary => .primary,
+        .quaternary => .secondary,
+    };
+}
+
 fn horizontalSplitFraction(event: TabDragMessage) ?f32 {
     if (!std.math.isFinite(event.y) or !std.math.isFinite(event.viewHeight)) return null;
     const available = event.viewHeight - workspace_chrome_height - horizontal_split_divider_height;
@@ -2598,6 +2636,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .open_terminal_in => |pane_id| openTerminalIn(model, pane_id, fx),
         .split_horizontal => |pane_id| setSplit(model, pane_id, .horizontal),
         .split_vertical => |pane_id| setSplit(model, pane_id, .vertical),
+        .close_pane => |pane_id| closePane(model, pane_id, fx),
         .select_project => |project_id| {
             model.project_menu_open = false;
             model.project_menu_id = 0;
@@ -2944,6 +2983,80 @@ test "workspace splits are bounded to two levels" {
     update(&model, .{ .split_horizontal = 4 }, &fx);
     try std.testing.expectEqual(SplitMode.horizontal, layout.primary_child_mode);
     try std.testing.expectEqual(SplitMode.vertical, layout.secondary_child_mode);
+}
+
+test "a pane that never held a tab closes from its strip" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    var fx: Effects = undefined;
+
+    update(&model, .{ .split_vertical = 1 }, &fx);
+    const layout = model.activeLayout().?;
+    try std.testing.expect(layout.secondary_panel_open);
+
+    // The root pane anchors the workspace and refuses to close.
+    update(&model, .{ .close_pane = 1 }, &fx);
+    try std.testing.expect(layout.secondary_panel_open);
+
+    layout.active_pane = .secondary;
+    update(&model, .{ .close_pane = 2 }, &fx);
+    try std.testing.expect(!layout.secondary_panel_open);
+    try std.testing.expectEqual(Pane.primary, layout.active_pane);
+}
+
+test "an empty secondary pane stays while its quaternary child holds tabs" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    var fx: Effects = undefined;
+
+    update(&model, .{ .split_vertical = 1 }, &fx);
+    update(&model, .{ .split_vertical = 2 }, &fx);
+    const layout = model.activeLayout().?;
+    insertTabRaw(layout, .quaternary, 9, 0);
+
+    update(&model, .{ .close_pane = 2 }, &fx);
+    try std.testing.expect(layout.secondary_panel_open);
+    try std.testing.expect(layout.secondary_child_open);
+    try std.testing.expectEqual(@as(u8, 1), paneCount(layout, .quaternary));
+}
+
+test "closing a pane retires its terminal and the panel with it" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+
+    update(&model, .{ .split_vertical = 1 }, &fx);
+    openTerminalIn(&model, 2, &fx);
+    const layout = model.activeLayout().?;
+    try std.testing.expectEqual(@as(u8, 1), paneCount(layout, .secondary));
+    try std.testing.expect(layout.term_started[0]);
+
+    update(&model, .{ .close_pane = 2 }, &fx);
+    try std.testing.expectEqual(@as(u8, 0), paneCount(layout, .secondary));
+    try std.testing.expect(!layout.secondary_panel_open);
+    try std.testing.expect(!layout.term_started[0]);
+}
+
+test "closing a pane retires its file tabs and the panel with it" {
+    var model: Model = .{};
+    model.active_project_id = addProject(&model, "/tmp/project").?;
+    syncUrls(&model);
+    var fx: Effects = undefined;
+
+    update(&model, .{ .split_vertical = 1 }, &fx);
+    const layout = model.activeLayout().?;
+    layout.active_pane = .secondary;
+    openFile(&model, .{ .project_id = 1, .path = "notes.txt" }, &fx);
+    try std.testing.expectEqual(@as(u8, 1), paneCount(layout, .secondary));
+
+    update(&model, .{ .close_pane = 2 }, &fx);
+    try std.testing.expectEqual(@as(u8, 0), paneCount(layout, .secondary));
+    try std.testing.expect(!layout.secondary_panel_open);
+    try std.testing.expect(!layout.file_tabs[0].used);
+    try std.testing.expectEqual(Pane.primary, layout.active_pane);
 }
 
 test "nested horizontal split drag uses its branch bounds" {

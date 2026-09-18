@@ -1,15 +1,20 @@
 <!-- Docyrus: native workspace chrome with local Monaco and @pierre/trees WebViews. -->
-<template name="pane-actions" args="pane_id">
+<!-- `closable` arms the pane's own Close button: every pane a split opened can
+     be destroyed again, while the primary pane anchors the workspace and only
+     ever sheds tabs. -->
+<template name="pane-actions" args="pane_id closable">
   <row padding="4" gap="1" cross="center">
     <button width="20" height="20" size="sm" variant="ghost" icon="terminal" on-press="open_terminal_in:{pane_id}" label="Open terminal"></button>
     <button width="20" height="20" size="sm" variant="ghost" icon="arrow-down" on-press="split_horizontal:{pane_id}" label="Split horizontally"></button>
     <button width="20" height="20" size="sm" variant="ghost" icon="panel-right" on-press="split_vertical:{pane_id}" label="Split vertically"></button>
+    <if test="{closable}"><button width="20" height="20" size="sm" variant="ghost" icon="x" on-press="close_pane:{pane_id}" label="Close panel"></button></if>
   </row>
 </template>
 
-<template name="leaf-pane-actions" args="pane_id">
+<template name="leaf-pane-actions" args="pane_id closable">
   <row padding="4" gap="1" cross="center">
     <button width="20" height="20" size="sm" variant="ghost" icon="terminal" on-press="open_terminal_in:{pane_id}" label="Open terminal"></button>
+    <if test="{closable}"><button width="20" height="20" size="sm" variant="ghost" icon="x" on-press="close_pane:{pane_id}" label="Close panel"></button></if>
   </row>
 </template>
 
@@ -291,8 +296,8 @@
           </for>
         </tabs>
       </scroll>
-      <if test="{primary_can_split}"><use template="pane-actions" pane_id="1" /></if>
-      <else><use template="leaf-pane-actions" pane_id="1" /></else>
+      <if test="{primary_can_split}"><use template="pane-actions" pane_id="1" closable="false" /></if>
+      <else><use template="leaf-pane-actions" pane_id="1" closable="false" /></else>
     </row>
     <separator />
     <if test="{primary_has_tabs}">
@@ -321,8 +326,8 @@
           </for>
         </tabs>
       </scroll>
-      <if test="{secondary_can_split}"><use template="pane-actions" pane_id="2" /></if>
-      <else><use template="leaf-pane-actions" pane_id="2" /></else>
+      <if test="{secondary_can_split}"><use template="pane-actions" pane_id="2" closable="true" /></if>
+      <else><use template="leaf-pane-actions" pane_id="2" closable="true" /></else>
     </row>
     <separator />
     <if test="{secondary_has_tabs}">
@@ -351,7 +356,7 @@
           </for>
         </tabs>
       </scroll>
-      <use template="leaf-pane-actions" pane_id="3" />
+      <use template="leaf-pane-actions" pane_id="3" closable="true" />
     </row>
     <separator />
     <if test="{tertiary_has_tabs}">
@@ -377,7 +382,7 @@
           </for>
         </tabs>
       </scroll>
-      <use template="leaf-pane-actions" pane_id="4" />
+      <use template="leaf-pane-actions" pane_id="4" closable="true" />
     </row>
     <separator />
     <if test="{quaternary_has_tabs}">
