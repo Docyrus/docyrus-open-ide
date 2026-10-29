@@ -61,8 +61,12 @@ jobs:
       # `native` asks before downloading its pinned Zig toolchain, and CI has no
       # tty to answer, so pass --yes. This step fetches it on a cold cache.
       #
-      # CI does not run `npm run build`: the ReleaseFast build dominates the run
-      # time, and `native test` already compiles the app in Debug. Run
-      # `npm run build` locally before anything that touches the build graph.
+      # npm appends forwarded arguments to the LAST command in a chained
+      # script, so `npm test -- --yes` never gives native the download flag.
+      # Bootstrap through npm exec, then run the remaining suites explicitly.
+      # CI does not run the slower ReleaseFast build; run that locally.
       - name: Test
-        run: npm test -- --yes
+        run: |
+          PATH="$HOME/.native/toolchains/zig-0.16.0:$PATH" npm exec -- native test --yes
+          npm run test:terminal
+          npm run test:remote
