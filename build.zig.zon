@@ -5,6 +5,10 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .native_sdk = .{ .path = "node_modules/@native-sdk/cli" },
+        .libssh2 = .{
+            .url = "https://codeload.github.com/libssh2/libssh2/tar.gz/94629f16bb313e522276b53a50f8d89c6eee81b0",
+            .hash = "N-V-__8AAP64LwDrKfDqyoGSCPI1_XiMtJy_s0JS8FIfvSZG",
+        },
         .ghostty = .{
             .url = "https://github.com/ghostty-org/ghostty/archive/7aa9591746ffa4d2eee458960c76554352832595.tar.gz",
             .hash = "ghostty-1.3.2-dev-5UdBC-edJAVXTdYsgHOzIqgAI7hE8VqpmriEi8zgufw2",

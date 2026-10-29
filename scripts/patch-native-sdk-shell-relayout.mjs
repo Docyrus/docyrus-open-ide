@@ -1,14 +1,18 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const target = fileURLToPath(
-  new URL("../node_modules/@native-sdk/cli/src/runtime/flow.zig", import.meta.url),
-);
-
-const source = readFileSync(target, "utf8");
 const marker = "// Docyrus: shell view frames are laid out in window-LOCAL";
 
-if (!source.includes(marker)) {
+// SDK 0.11 separates compiled host-flow actions from the Zig fallback. Patch
+// both paths: Zig-core apps use the fallback when no host policy is installed.
+for (const file of ["flow.zig", "flow_reference.zig"]) {
+  const target = fileURLToPath(
+    new URL(`../node_modules/@native-sdk/cli/src/runtime/${file}`, import.meta.url),
+  );
+  if (!existsSync(target) && file === "flow_reference.zig") continue;
+  let source = readFileSync(target, "utf8");
+  if (source.includes(marker)) continue;
+
   const original = `                    const was_open = if (WindowViewMethods().findWindowIndexById(self, state.id)) |index| self.windows[index].info.open else false;
                     WindowViewMethods().updateWindowState(self, state) catch |err| log(self, "window.state.update_failed", @errorName(err), &.{trace.string("label", state.label)});
                     WindowViewMethods().relayoutShellViews(self, state.id) catch |err| log(self, "shell.relayout_failed", @errorName(err), &.{trace.uint("window_id", state.id)});`;
@@ -36,11 +40,49 @@ if (!source.includes(marker)) {
                         WindowViewMethods().relayoutShellViews(self, state.id) catch |err| log(self, "shell.relayout_failed", @errorName(err), &.{trace.uint("window_id", state.id)});
                     }`;
 
-  if (!source.includes(original)) {
-    throw new Error(
-      "The installed Native SDK window-frame relayout changed; update the Docyrus shell-relayout patch before building.",
-    );
+  if (source.includes(original)) {
+    writeFileSync(target, source.replace(original, () => replacement));
+    continue;
   }
 
-  writeFileSync(target, source.replace(original, replacement));
+  const actions = [
+    [
+      "            var was_open = false;",
+      "            var was_open = false;\n            var shell_bounds_changed = true;",
+    ],
+    [
+      `                    was_open = if (WindowViewMethods().findWindowIndexById(self, state.id)) |index| self.windows[index].info.open else false;`,
+      `                    const previous_index = WindowViewMethods().findWindowIndexById(self, state.id);
+                    was_open = if (previous_index) |index| self.windows[index].info.open else false;
+                    ${marker}
+                    // bounds, so capture the size before window_update and
+                    // avoid resetting anchored WebViews on a pure move.
+                    shell_bounds_changed = if (previous_index) |index|
+                        self.windows[index].info.frame.width != state.frame.width or
+                            self.windows[index].info.frame.height != state.frame.height
+                    else
+                        true;`,
+    ],
+    [
+      `                .window_layout => {
+                    const state = event_value.window_frame_changed;
+                    WindowViewMethods().relayoutShellViews(self, state.id) catch |err| log(self, "shell.relayout_failed", @errorName(err), &.{trace.uint("window_id", state.id)});
+                },`,
+      `                .window_layout => {
+                    const state = event_value.window_frame_changed;
+                    if (shell_bounds_changed) {
+                        WindowViewMethods().relayoutShellViews(self, state.id) catch |err| log(self, "shell.relayout_failed", @errorName(err), &.{trace.uint("window_id", state.id)});
+                    }
+                },`,
+    ],
+  ];
+  for (const [before, after] of actions) {
+    if (!source.includes(before)) {
+      throw new Error(
+        "The installed Native SDK window-frame relayout changed; update the Docyrus shell-relayout patch before building.",
+      );
+    }
+    source = source.replace(before, () => after);
+  }
+  writeFileSync(target, source);
 }

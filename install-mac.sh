@@ -2,9 +2,9 @@
 set -euo pipefail
 
 APP_NAME="Docyrus Open IDE"
-RELEASE_TAG="v0.1.10"
-ARCHIVE_NAME="Docyrus-Open-IDE-v0.1.10-macos-arm64.zip"
-EXPECTED_SHA256="41009ae1d7b41bb7b4e7a0d966353469b9a667fc6f275bf7ae50da5c7569c788"
+RELEASE_TAG="v0.1.11"
+ARCHIVE_NAME="Docyrus-Open-IDE-v0.1.11-macos-arm64.zip"
+EXPECTED_SHA256="ed8685099afc61d362662e51ee92d6c7b58cfbf347354512460f014d7a58a2d6"
 INSTALL_PATH="/Applications/${APP_NAME}.app"
 DOWNLOAD_URL="https://github.com/Docyrus/docyrus-open-ide/releases/download/${RELEASE_TAG}/${ARCHIVE_NAME}"
 
@@ -18,7 +18,7 @@ if [[ "$(uname -m)" != "arm64" ]]; then
   exit 1
 fi
 
-for command in curl ditto pgrep shasum xattr open; do
+for command in curl ditto pgrep shasum codesign xattr open; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     echo "Required command not found: ${command}" >&2
     exit 1
@@ -41,6 +41,11 @@ ditto -x -k "${TEMP_DIR}/${ARCHIVE_NAME}" "${TEMP_DIR}/expanded"
 SOURCE_APP="${TEMP_DIR}/expanded/${APP_NAME}.app"
 if [[ ! -d "${SOURCE_APP}" ]]; then
   echo "The release archive did not contain ${APP_NAME}.app." >&2
+  exit 1
+fi
+
+if ! codesign --verify --deep --strict --test-requirement '=anchor apple generic and certificate leaf[subject.OU] = "U54AJHZF3Z" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' "${SOURCE_APP}"; then
+  echo "The app signature did not match the Docyrus Developer ID; refusing to install." >&2
   exit 1
 fi
 

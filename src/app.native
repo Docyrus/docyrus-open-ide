@@ -475,6 +475,7 @@
     <badge variant="secondary">OPEN IDE</badge>
     <spacer grow="1" />
     <text foreground="text_muted">{workspace_path}</text>
+    <if test="{has_remote_error}"><button size="sm" variant="ghost" on-press="open_add_project" label="{remote_error}">Connection issue</button></if>
     <button size="sm" variant="ghost" icon="settings" on-press="open_settings" label="Settings"></button>
   </row>
   <separator />
@@ -553,19 +554,29 @@
 
   <if test="{add_project_open}">
     <dialog label="Add project folder" on-dismiss="close_add_project">
-      <column width="560" height="460" padding="24" gap="14">
+      <column width="600" height="640" padding="24" gap="14">
         <column gap="6">
           <text size="heading">Add project folder</text>
-          <text foreground="text_muted" wrap="true">Choose a directory, or reopen one of your recent projects.</text>
+          <text foreground="text_muted" wrap="true">Choose a local folder, connect to a remote folder, or reopen a recent project.</text>
         </column>
-        <button variant="primary" icon="folder" on-press="choose_project_directory">Choose Folder...</button>
+        <button variant="primary" icon="folder" on-press="choose_project_directory" disabled="{remote_connecting}">Choose Folder...</button>
+        <separator />
+        <text>SSH / SFTP</text>
+        <text-field text="{remote_url}" on-input="remote_url_input" on-submit="connect_remote_project" disabled="{remote_connecting}" placeholder="ssh://user@host:22/home/user/project" label="Remote project URL" />
+        <text size="sm" foreground="text_muted" wrap="true">Connect uses keys loaded in your SSH agent (ssh-add) and ~/.ssh/known_hosts. Use the SSH terminal to verify a new host or sign in with a password.</text>
+        <row gap="8">
+          <button variant="primary" on-press="connect_remote_project" disabled="{remote_connecting}">Connect Folder</button>
+          <button variant="secondary" icon="terminal" on-press="open_connection_terminal" disabled="{remote_connecting}">Open SSH Terminal</button>
+        </row>
+        <if test="{remote_connecting}"><text foreground="text_muted">Connecting...</text></if>
+        <if test="{has_remote_error}"><text foreground="destructive" wrap="true">{remote_error}</text></if>
         <separator />
         <text>RECENT PROJECTS</text>
         <if test="{has_recent_projects}">
           <scroll grow="1">
             <column gap="4">
               <for each="recentProjects" key="id" as="recent">
-                <panel role="button" on-press="open_recent_project:{recent.id}" label="{recent.path}">
+                <panel role="button" on-press="open_recent_project:{recent.id}" disabled="{remote_connecting}" label="{recent.path}">
                   <row padding="6" gap="8" cross="center">
                     <column grow="1" gap="2" cross="start">
                       <text>{recent.name}</text>

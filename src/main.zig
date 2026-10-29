@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
+const remote = @import("remote.zig");
 
 pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 
@@ -68,7 +69,8 @@ const Pane = enum(u8) { primary = 1, secondary = 2, tertiary = 3, quaternary = 4
 const SplitMode = enum { horizontal, vertical };
 const ThemeMode = enum(u8) { system = 0, light = 1, dark = 2 };
 const FileKind = enum(u8) { code, markdown, image, text, pdf };
-const ProjectKind = enum(u8) { folder, external_files };
+const ProjectKind = enum(u8) { folder, external_files, remote };
+const remote_channel_key: u64 = 9001;
 
 const system_open_view_label = "__docyrus_open_files__";
 const other_open_files_name = "Other Open Files";
@@ -178,6 +180,7 @@ const EditorAction = enum(u8) { none, save_and_close, discard_and_close };
 const FileTab = struct {
     used: bool = false,
     dirty: bool = false,
+    remote_loaded: bool = false,
     kind: FileKind = .text,
     // Markdown opens as a reading surface. The Monaco pane joins it only when
     // the Editor toggle, an explorer "Edit" action, or a save prompt asks.
@@ -371,6 +374,9 @@ pub const Model = struct {
         "unsupported_file_path_len",
         "project_switching",
         "directory_picker_requested",
+        "remote_url_buffer",
+        "remote_error_buffer",
+        "remote_connect_requested",
         "terminal_open_requested",
         "terminal_open_line",
         "terminal_open_path_buffer",
@@ -423,6 +429,10 @@ pub const Model = struct {
     home_path_buffer: [project_path_capacity]u8 = undefined,
     home_path_len: usize = 0,
     add_project_open: bool = false,
+    remote_url_buffer: canvas.TextBuffer(project_path_capacity + 1) = .{},
+    remote_error_buffer: canvas.TextBuffer(512) = .{},
+    remote_connect_requested: bool = false,
+    remote_connecting: bool = false,
     settings_open: bool = false,
     project_menu_open: bool = false,
     project_menu_id: u32 = 0,
@@ -910,7 +920,7 @@ pub const Model = struct {
 
     fn findProject(model: *const Model, path: []const u8) ?usize {
         for (model.projects[0..model.project_count], 0..) |*project, index| {
-            if (project.kind == .folder and std.mem.eql(u8, project.path(), path)) return index;
+            if (project.kind != .external_files and std.mem.eql(u8, project.path(), path)) return index;
         }
         return null;
     }
@@ -920,6 +930,16 @@ pub const Model = struct {
             if (project.kind == .external_files) return index;
         }
         return null;
+    }
+
+    pub fn remote_url(model: *const Model) []const u8 {
+        return model.remote_url_buffer.text();
+    }
+    pub fn remote_error(model: *const Model) []const u8 {
+        return model.remote_error_buffer.text();
+    }
+    pub fn has_remote_error(model: *const Model) bool {
+        return model.remote_error_buffer.text().len > 0;
     }
 };
 
@@ -944,6 +964,9 @@ pub const Msg = union(enum) {
         "toggle_markdown_editor",
         "toggle_markdown_preview",
         "finish_project_switch",
+        "remote_connection_event",
+        "remote_error_message",
+        "remote_surfaces_ready",
     };
 
     pty: native_sdk.EffectPtyEvent,
@@ -993,6 +1016,12 @@ pub const Msg = union(enum) {
     open_add_project,
     close_add_project,
     choose_project_directory,
+    remote_url_input: canvas.TextInputEvent,
+    connect_remote_project,
+    open_connection_terminal,
+    remote_connection_event: native_sdk.EffectChannelEvent,
+    remote_error_message: []const u8,
+    remote_surfaces_ready,
     open_recent_project: u32,
     remove_recent_project: u32,
     directory_selected: []const u8,
@@ -1269,8 +1298,9 @@ fn statusText(model: *const Model, pane: Pane, arena: std.mem.Allocator) []const
 }
 
 fn normalizeProjectPath(path: []const u8) []const u8 {
+    const minimum = if (remote.isRemote(path)) (std.mem.indexOfScalarPos(u8, path, if (std.mem.startsWith(u8, path, "ssh://")) 6 else 7, '/') orelse path.len) + 1 else 1;
     var end = path.len;
-    while (end > 1 and (path[end - 1] == '/' or path[end - 1] == '\\')) end -= 1;
+    while (end > minimum and (path[end - 1] == '/' or path[end - 1] == '\\')) end -= 1;
     return path[0..end];
 }
 
@@ -1307,7 +1337,11 @@ fn addProject(model: *Model, raw_path: []const u8) ?u32 {
     const path = normalizeProjectPath(raw_path);
     // Project roots must always be absolute. This prevents file operations from
     // ever resolving relative to the directory that launched the app.
-    if (path.len == 0 or !std.fs.path.isAbsolute(path)) return null;
+    if (path.len == 0 or path.len > project_path_capacity) return null;
+    const is_remote = remote.isRemote(path);
+    if (is_remote) {
+        _ = remote.Config.parse(path) catch return null;
+    } else if (!std.fs.path.isAbsolute(path)) return null;
     if (model.findProject(path)) |index| {
         const project = &model.projects[index];
         addRecentProjectNamed(model, path, project.name_buffer[0..project.name_len]);
@@ -1316,6 +1350,7 @@ fn addProject(model: *Model, raw_path: []const u8) ?u32 {
     if (model.project_count >= max_projects) return null;
     const index: usize = model.project_count;
     model.projects[index] = .{};
+    if (is_remote) model.projects[index].kind = .remote;
     model.projects[index].setPath(path);
     model.projects[index].setDisplayName(recentDisplayName(model, path));
     model.project_count += 1;
@@ -1407,6 +1442,7 @@ fn openSystemFile(model: *Model, message: SystemOpenFileMessage, fx: *Effects) v
 fn selectProject(model: *Model, project_id: u32) void {
     if (project_id == 0 or project_id > model.project_count or project_id == model.active_project_id) return;
     model.active_project_id = project_id;
+    model.remote_error_buffer.clear();
     model.project_switching = true;
     model.preview_image = 0;
     bumpAllEditorReloads(model);
@@ -1622,6 +1658,8 @@ fn panePreviewPath(model: *Model, pane: Pane) []const u8 {
     const layout = model.activeLayoutConst() orelse return "";
     const id = layout.pane_active_tabs[paneIndex(pane)];
     if (id < 1 or id > max_file_tabs) return "";
+    const project = model.activeProjectConst() orelse return "";
+    if (project.kind == .remote) return remotePreviewPath(model, project, layout.file_tabs[id - 1].path(), &model.path_scratch) catch "";
     return fullPathForTab(model, id);
 }
 
@@ -1709,13 +1747,14 @@ fn openFile(model: *Model, message: OpenFileMessage, fx: *Effects) void {
 fn openFileInPane(model: *Model, message: OpenFileMessage, target: ?Pane, fx: *Effects) void {
     if (message.project_id != model.active_project_id) return;
     const project = model.activeProjectConst() orelse return;
-    if (project.kind == .folder) {
+    if (project.kind != .external_files) {
         if (!isSafeRelativePath(message.path)) return;
     } else if (!std.fs.path.isAbsolute(message.path) or externalFileIndex(model, message.path) == null) return;
     const layout = model.activeLayout() orelse return;
     const slot = findFileSlot(layout, message.path) orelse availableFileSlot(layout) orelse return;
     const tab = &layout.file_tabs[slot];
     if (!tab.used) tab.setPath(message.path);
+    if (project.kind == .remote) tab.remote_loaded = true;
     if (tab.kind == .markdown) {
         tab.setMarkdown(message.markdown);
         if (message.edit) tab.markdown_editor_visible = true;
@@ -1743,7 +1782,7 @@ fn moveTabToPane(layout: *LayoutState, id: u8, pane: Pane) void {
 fn applyPathMove(model: *Model, message: PathMovedMessage) void {
     if (message.project_id != model.active_project_id) return;
     const project = model.activeProjectConst() orelse return;
-    if (project.kind != .folder) return;
+    if (project.kind == .external_files) return;
     if (!isSafeRelativePath(message.from) or !isSafeRelativePath(message.to)) return;
     const from = std.mem.trimEnd(u8, message.from, "/");
     const to = std.mem.trimEnd(u8, message.to, "/");
@@ -1760,6 +1799,7 @@ fn applyPathMove(model: *Model, message: PathMovedMessage) void {
         else
             continue;
         tab.movePath(moved);
+        if (project.kind == .remote) tab.remote_loaded = false;
     }
     syncUrls(model);
 }
@@ -1767,7 +1807,7 @@ fn applyPathMove(model: *Model, message: PathMovedMessage) void {
 fn applyPathDelete(model: *Model, message: PathDeletedMessage, fx: *Effects) void {
     if (message.project_id != model.active_project_id) return;
     const project = model.activeProjectConst() orelse return;
-    if (project.kind != .folder) return;
+    if (project.kind == .external_files) return;
     if (!isSafeRelativePath(message.path)) return;
     const removed = std.mem.trimEnd(u8, message.path, "/");
     if (removed.len == 0) return;
@@ -2211,6 +2251,19 @@ fn requestTerminalFileOpen(model: *Model, target: []const u8, line: u32) void {
 // and an absolute path needs no root at all.
 fn resolveTerminalPath(model: *const Model, target: []const u8, buffer: []u8) ?[]const u8 {
     if (target.len == 0 or std.mem.indexOfScalar(u8, target, 0) != null) return null;
+    if (model.activeProjectConst()) |project| {
+        if (project.kind == .remote) {
+            const config = remote.Config.parse(project.path()) catch return null;
+            const root = std.mem.sliceTo(&config.root, 0);
+            const relative = if (std.fs.path.isAbsolute(target)) blk: {
+                if (std.mem.eql(u8, root, "/")) break :blk target[1..];
+                if (!pathIsInsideProject(target, root)) return null;
+                break :blk target[root.len + 1 ..];
+            } else if (std.mem.startsWith(u8, target, "./")) target[2..] else target;
+            if (std.mem.startsWith(u8, relative, "~/") or !isSafeRelativePath(relative)) return null;
+            return fullPath(project, relative, buffer) catch null;
+        }
+    }
     if (std.fs.path.isAbsolute(target)) return target;
     if (std.mem.startsWith(u8, target, "~/")) {
         const home = model.homePath();
@@ -2468,7 +2521,24 @@ fn fullPath(project: *const ProjectState, relative: []const u8, output: []u8) ![
         return relative;
     }
     if (!isSafeRelativePath(relative)) return error.InvalidPath;
+    if (project.kind == .remote) return std.fmt.bufPrint(output, "{s}{s}{s}", .{ project.path(), if (std.mem.endsWith(u8, project.path(), "/")) "" else "/", relative });
     return std.fmt.bufPrint(output, "{s}/{s}", .{ project.path(), relative });
+}
+
+fn remotePreviewPath(model: *const Model, project: *const ProjectState, path: []const u8, output: []u8) ![]const u8 {
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    hash.update(project.path());
+    hash.update(&.{0});
+    hash.update(path);
+    var digest: [32]u8 = undefined;
+    hash.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return std.fmt.bufPrint(output, "{s}/Library/Caches/{s}/remote/{s}{s}", .{ model.homePath(), bundle_id, hex, std.fs.path.extension(path) });
+}
+
+fn remoteAbsolutePath(project: *const ProjectState, relative: []const u8, output: []u8) ![]const u8 {
+    const config = try remote.Config.parse(project.path());
+    return std.fmt.bufPrint(output, "{s}{s}{s}", .{ std.mem.sliceTo(&config.root, 0), if (config.root[1] == 0) "" else "/", relative });
 }
 
 fn fullPathForTab(model: *Model, id: u32) []const u8 {
@@ -2501,7 +2571,9 @@ fn copyTabPath(model: *Model, id: u32, absolute: bool, fx: *Effects) void {
 }
 
 fn ensureImage(model: *Model, id: u32, fx: *Effects) void {
-    const path = fullPathForTab(model, id);
+    const project = model.activeProjectConst() orelse return;
+    var cache_buffer: [2048]u8 = undefined;
+    const path = if (project.kind == .remote) remotePreviewPath(model, project, project.layout.file_tabs[id - 1].path(), &cache_buffer) catch return else fullPathForTab(model, id);
     model.preview_image_path_len = @min(path.len, model.preview_image_path.len);
     @memcpy(model.preview_image_path[0..model.preview_image_path_len], path[0..model.preview_image_path_len]);
     model.preview_image = 0;
@@ -2529,14 +2601,57 @@ fn ensureTerminal(model: *Model, terminal_index: u8, fx: *Effects) void {
     if (terminal_index >= max_terminals) return;
     if (project.layout.term_started[terminal_index]) return;
     project.layout.term_started[terminal_index] = true;
-    var storage: [5][]const u8 = undefined;
+    var storage: [20][]const u8 = undefined;
+    var config: remote.Config = .{};
+    var command: [8192]u8 = undefined;
     fx.ptySpawn(.{
         .key = terminalKey(model.active_project_id, terminal_index),
-        .argv = shellArgv(project, &storage),
+        .argv = if (project.kind == .remote) remoteShellArgv(project.path(), &config, &command, &storage) catch {
+            project.layout.term_started[terminal_index] = false;
+            return;
+        } else shellArgv(project, storage[0..5]),
         .cols = 100,
         .rows = 28,
         .on_event = Effects.ptyMsg(.pty),
     });
+}
+
+fn remoteShellArgv(uri: []const u8, config: *remote.Config, command: []u8, storage: *[20][]const u8) ![]const []const u8 {
+    config.* = try remote.Config.parse(uri);
+    var quoted: [4096]u8 = undefined;
+    const root = shellQuotePath(std.mem.sliceTo(&config.root, 0), &quoted) orelse return error.InvalidPath;
+    const script = try std.fmt.bufPrint(command, "cd -- {s}&& exec \"${{SHELL:-/bin/sh}}\" -l", .{root});
+    storage[0..14].* = .{ "/usr/bin/ssh", "-tt", "-o", "StrictHostKeyChecking=ask", "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes", "-p", std.mem.sliceTo(&config.port_text, 0), "-l", std.mem.sliceTo(&config.user, 0), std.mem.sliceTo(&config.host, 0), script };
+    return storage[0..14];
+}
+
+fn beginRemoteConnection(model: *Model, fx: *Effects) void {
+    if (model.remote_connecting) return;
+    const uri = std.mem.trim(u8, model.remote_url_buffer.text(), " ");
+    _ = remote.Config.parse(uri) catch {
+        model.remote_error_buffer.set("Enter ssh://user@host:22/absolute/folder or sftp://user@host/absolute/folder. Passwords are not stored in URLs.");
+        return;
+    };
+    if (model.project_count >= max_projects and model.findProject(uri) == null) {
+        model.remote_error_buffer.set("Close a project before adding another (maximum 10).");
+        return;
+    }
+    model.remote_url_buffer.set(uri);
+    model.remote_error_buffer.clear();
+    model.remote_connecting = true;
+    model.remote_connect_requested = true;
+    _ = fx.openChannel(.{ .key = remote_channel_key, .on_event = Effects.channelMsg(.remote_connection_event), .max_pending = 2 });
+}
+
+fn openRemoteProject(model: *Model) ?u32 {
+    const id = addProject(model, model.remote_url_buffer.text()) orelse {
+        model.remote_error_buffer.set("Could not add the connection. Check the URL or close a project (maximum 10).");
+        return null;
+    };
+    model.add_project_open = false;
+    model.tree_reload_token +%= 1;
+    selectProject(model, id);
+    return id;
 }
 
 /// Start whatever the panes are showing but have never run: the shell behind an
@@ -2576,6 +2691,45 @@ fn handlePtyEvent(model: *Model, event: native_sdk.EffectPtyEvent) void {
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
+        .remote_surfaces_ready => {
+            model.preview_image = 0;
+            inline for (std.meta.tags(Pane)) |pane| if (paneFileKind(model, pane) == .pdf) {
+                bumpEditorReload(model, pane);
+            };
+            ensureActiveSurfaces(model, fx);
+        },
+        .remote_error_message => |message| model.remote_error_buffer.set(message),
+        .remote_url_input => |edit| if (!model.remote_connecting) {
+            model.remote_url_buffer.apply(edit);
+            model.remote_error_buffer.clear();
+        },
+        .connect_remote_project => beginRemoteConnection(model, fx),
+        .open_connection_terminal => {
+            if (model.remote_connecting) return;
+            _ = remote.Config.parse(model.remote_url_buffer.text()) catch {
+                beginRemoteConnection(model, fx);
+                return;
+            };
+            if (openRemoteProject(model) != null) openTerminalIn(model, 1, fx);
+        },
+        .remote_connection_event => |event| switch (event.kind) {
+            .data => {
+                if (!model.remote_connecting) return;
+                if (event.key != remote_channel_key) return;
+                model.remote_connecting = false;
+                model.remote_connect_requested = false;
+                if (event.bytes.len > 0 and event.bytes[0] == '1') {
+                    _ = openRemoteProject(model);
+                } else model.remote_error_buffer.set(if (event.bytes.len > 1) event.bytes[1..] else "Connection failed. Retry after checking the server.");
+                fx.closeChannel(remote_channel_key);
+            },
+            .rejected => {
+                model.remote_connecting = false;
+                model.remote_connect_requested = false;
+                model.remote_error_buffer.set("Could not start the connection. Please retry.");
+            },
+            .closed => {},
+        },
         .pty => |event| handlePtyEvent(model, event),
         .clipboard_result => {},
         .image_loaded => |result| if (result.id == model.preview_image_request and result.outcome == .loaded) {
@@ -2624,13 +2778,16 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .cancel_close_tab => clearCloseRequest(model),
         .copy_path => |id| copyTabPath(model, id, true, fx),
         .copy_relative_path => |id| copyTabPath(model, id, false, fx),
-        .reveal_in_finder => |id| fx.hostSend("native-sdk.os.revealPath", fullPathForTab(model, id)),
+        .reveal_in_finder => |id| {
+            const path = fullPathForTab(model, id);
+            if (!remote.isRemote(path)) fx.hostSend("native-sdk.os.revealPath", path);
+        },
         .reveal_path => |path| fx.hostSend("native-sdk.os.revealPath", path),
         .show_unsupported_file => |message| showUnsupportedFile(model, message.path, message.reason),
         .close_unsupported_file => model.unsupported_file_open = false,
         .reveal_unsupported_file => {
             const path = model.unsupportedFilePath();
-            if (path.len > 0) fx.hostSend("native-sdk.os.revealPath", path);
+            if (std.fs.path.isAbsolute(path)) fx.hostSend("native-sdk.os.revealPath", path);
             model.unsupported_file_open = false;
         },
         .open_terminal_in => |pane_id| openTerminalIn(model, pane_id, fx),
@@ -2688,8 +2845,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.project_menu_open = false;
             model.project_menu_id = 0;
             model.add_project_open = true;
+            if (!model.remote_connecting) if (model.activeProjectConst()) |project| {
+                if (project.kind == .remote) model.remote_url_buffer.set(project.path());
+            };
         },
         .close_add_project => {
+            if (model.remote_connecting) return;
             // With no project there is no useful workspace behind this
             // chooser. Keep it modal until a folder or external file opens.
             if (model.project_count > 0) {
@@ -2699,6 +2860,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .choose_project_directory => model.directory_picker_requested = true,
         .open_recent_project => |recent_id| {
+            if (model.remote_connecting) return;
             if (recent_id > 0 and recent_id <= model.recent_count) {
                 const path = model.recent_projects[recent_id - 1].path();
                 var copy: [project_path_capacity]u8 = undefined;
@@ -4264,6 +4426,122 @@ test "the session signature tracks the workspace and nothing else" {
     try std.testing.expect(sessionSignature(&model) != with_tab);
 }
 
+test "remote projects restore offline and keep relative tabs and recent connections" {
+    const model = try testModel();
+    defer std.testing.allocator.destroy(model);
+    const uri = "sftp://alice@example.invalid:2222/home/alice/project";
+    model.active_project_id = addProject(model, uri).?;
+    try std.testing.expectEqual(ProjectKind.remote, model.projects[0].kind);
+    var fx: Effects = undefined;
+    openFile(model, .{ .project_id = 1, .path = "src/main.zig" }, &fx);
+    applyPathMove(model, .{ .project_id = 1, .from = "src", .to = "source" });
+    try std.testing.expect(!model.projects[0].layout.file_tabs[0].remote_loaded);
+    renameProject(model, 1, "Remote app");
+    const restored = try testModel();
+    defer std.testing.allocator.destroy(restored);
+    try roundTripSession(model, restored);
+    try std.testing.expectEqual(@as(u8, 1), restored.project_count);
+    try std.testing.expectEqualStrings(uri, restored.projects[0].path());
+    try std.testing.expectEqualStrings("Remote app", restored.projects[0].displayName());
+    try std.testing.expectEqualStrings("source/main.zig", restored.projects[0].layout.file_tabs[0].path());
+    try std.testing.expectEqualStrings(uri, restored.recent_projects[0].path());
+    try std.testing.expect(projectContainingFile(restored, "/home/alice/project/source/main.zig") == null);
+    try std.testing.expect(addProject(restored, "ssh://alice:secret@example.invalid/a") == null);
+    try std.testing.expect(addProject(restored, "ssh://alice@example.invalid/") != null);
+}
+
+test "SSH terminal arguments keep remote shell characters inside the folder word" {
+    var config: remote.Config = .{};
+    var script: [8192]u8 = undefined;
+    var storage: [20][]const u8 = undefined;
+    const argv = try remoteShellArgv("ssh://alice@example.invalid:2222/home/alice/a%20'quoted';$(touch%20bad)", &config, &script, &storage);
+    try std.testing.expectEqualStrings("/usr/bin/ssh", argv[0]);
+    try std.testing.expectEqualStrings("2222", argv[9]);
+    try std.testing.expectEqualStrings("alice", argv[11]);
+    try std.testing.expectEqualStrings("example.invalid", argv[12]);
+    try std.testing.expectEqualStrings("cd -- '/home/alice/a '\\''quoted'\\'';$(touch bad)' && exec \"${SHELL:-/bin/sh}\" -l", argv[13]);
+}
+
+test "remote terminal file links stay on their server and inside their project" {
+    const model = try testModel();
+    defer std.testing.allocator.destroy(model);
+    model.setHomePath("/Users/local");
+    model.active_project_id = addProject(model, "ssh://alice@host/home/alice/project").?;
+    var buffer: [2048]u8 = undefined;
+    try std.testing.expectEqualStrings("ssh://alice@host/home/alice/project/src/main.zig", resolveTerminalPath(model, "src/main.zig", &buffer).?);
+    try std.testing.expectEqualStrings("ssh://alice@host/home/alice/project/src/main.zig", resolveTerminalPath(model, "/home/alice/project/src/main.zig", &buffer).?);
+    try std.testing.expect(resolveTerminalPath(model, "/Users/local/secret.txt", &buffer) == null);
+    try std.testing.expect(resolveTerminalPath(model, "~/secret.txt", &buffer) == null);
+    try std.testing.expect(resolveTerminalPath(model, "../secret.txt", &buffer) == null);
+}
+
+test "explorer bridge rejects stale project ids before touching a remote connection" {
+    const app = try DocyrusApp.create(std.testing.allocator, appOptions(std.testing.io));
+    defer app.destroy();
+    _ = addProject(&app.model, "/tmp/local-project").?;
+    app.model.active_project_id = addProject(&app.model, "ssh://alice@example.invalid/project").?;
+    var host: AppHost = .{ .ui = app, .base = undefined, .io = std.testing.io };
+    var request: native_sdk.bridge.Invocation = .{
+        .request = .{ .id = "test", .command = "workspace.deletePath", .payload = "{\"projectId\":1,\"path\":\"file.txt\"}" },
+        .source = .{ .webview_label = tree_view_label },
+    };
+    try std.testing.expectError(error.InactiveProject, host.activeBridgeProject(request));
+    request.request.payload = "{\"projectId\":2}";
+    try std.testing.expectEqual(ProjectKind.remote, (try host.activeBridgeProject(request)).project.kind);
+    request.source.webview_label = primary_editor_view_label;
+    try std.testing.expectError(error.InvalidBridgeSource, host.activeBridgeProject(request));
+}
+
+test "remote connect failures keep the chooser open and success adds a project" {
+    const model = try testModel();
+    defer std.testing.allocator.destroy(model);
+    model.add_project_open = true;
+    model.remote_url_buffer.set("ssh://alice@example.invalid/home/alice/app");
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    update(model, .connect_remote_project, &fx);
+    try std.testing.expect(model.remote_connecting);
+    addRecentProject(model, "/tmp/another-project");
+    update(model, .{ .open_recent_project = 1 }, &fx);
+    try std.testing.expectEqual(@as(u8, 0), model.project_count);
+    update(model, .close_add_project, &fx);
+    try std.testing.expect(model.add_project_open);
+    update(model, .{ .remote_connection_event = .{ .key = remote_channel_key, .bytes = "0Host key changed" } }, &fx);
+    try std.testing.expectEqual(@as(u8, 0), model.project_count);
+    try std.testing.expect(!model.remote_connecting);
+    try std.testing.expectEqualStrings("Host key changed", model.remote_error());
+    // The transport result is data; no network is performed during model tests.
+    model.remote_connecting = true;
+    update(model, .{ .remote_connection_event = .{ .key = remote_channel_key, .bytes = "1" } }, &fx);
+    try std.testing.expectEqual(@as(u8, 1), model.project_count);
+    try std.testing.expect(!model.add_project_open);
+    try std.testing.expectEqual(ProjectKind.remote, model.projects[0].kind);
+}
+
+test "remote tree pages stay under the bridge limit with escaped filenames" {
+    var listing: remote.Listing = .{};
+    defer listing.deinit();
+    for (0..200) |i| {
+        const path = try std.fmt.allocPrint(listing.arena.allocator(), "directory/very-long-file-\"quoted\"-{d}.txt", .{i});
+        try listing.entries.append(listing.arena.allocator(), .{ .path = path, .directory = false });
+    }
+    var output: [12 * 1024]u8 = undefined;
+    var offset: usize = 0;
+    var count: usize = 0;
+    while (true) {
+        const json = try writeRemoteTreeJson("ssh://alice@host/project", &listing, offset, &output);
+        try std.testing.expect(json.len <= bridge_tree_page_budget);
+        const parsed = try std.json.parseFromSlice(struct { paths: []const []const u8, done: bool, nextOffset: usize }, std.testing.allocator, json, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        count += parsed.value.paths.len;
+        if (parsed.value.done) break;
+        try std.testing.expect(parsed.value.nextOffset > offset);
+        offset = parsed.value.nextOffset;
+    }
+    try std.testing.expectEqual(listing.entries.items.len, count);
+}
+
 const app_permissions = [_][]const u8{
     native_sdk.security.permission_command,
     native_sdk.security.permission_view,
@@ -4436,11 +4714,36 @@ const BridgeEditorDirty = struct {
     dirty: bool,
 };
 
+const RemoteConnectJob = struct {
+    uri: [1025]u8 = @splat(0),
+    home: [1024]u8 = @splat(0),
+    channel: native_sdk.ChannelHandle,
+    client: ?remote.Client = null,
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn run(self: *RemoteConnectJob) void {
+        var message: [512]u8 = @splat(0);
+        var response: [513]u8 = @splat(0);
+        self.client = remote.Client.connect(std.mem.sliceTo(&self.uri, 0), std.mem.sliceTo(&self.home, 0), &message) catch |err| blk: {
+            response[0] = '0';
+            const detail = if (message[0] != 0) std.mem.sliceTo(&message, 0) else @errorName(err);
+            @memcpy(response[1 .. detail.len + 1], detail);
+            break :blk null;
+        };
+        if (self.client != null) response[0] = '1';
+        self.done.store(true, .release);
+        _ = self.channel.post(std.mem.sliceTo(&response, 0));
+    }
+};
+
 const AppHost = struct {
     ui: *DocyrusApp,
     base: native_sdk.App,
     io: std.Io,
     runtime: ?*native_sdk.Runtime = null,
+    remote_clients: remote.Manager = .{},
+    remote_job: ?*RemoteConnectJob = null,
     preferences_path: [1024]u8 = undefined,
     preferences_path_len: usize = 0,
     pending_open_files: [max_pending_open_files]ExternalFile = [_]ExternalFile{.{}} ** max_pending_open_files,
@@ -4489,6 +4792,9 @@ const AppHost = struct {
             try self.dispatchSystemOpen(runtime, 1, pending.path(), 0);
         }
         self.pending_open_file_count = 0;
+        if (self.ui.model.activeProject()) |project| {
+            if (project.kind == .remote and !project.layout.explorer_open) self.hydrateRemoteTabs(project) catch {};
+        }
         // A restored or command-line PDF pane already asked its WebView to
         // navigate; WebKit delivers that scheme task on a later runloop turn,
         // so publishing here still beats it to the slot table. Without this,
@@ -4499,6 +4805,7 @@ const AppHost = struct {
     fn eventFn(context: *anyopaque, runtime: *native_sdk.Runtime, event: native_sdk.Event) anyerror!void {
         const self: *AppHost = @ptrCast(@alignCast(context));
         try self.base.event(runtime, event);
+        try self.serviceRemoteConnection();
         switch (event) {
             .files_dropped => |drop| if (std.mem.eql(u8, drop.view_label, system_open_view_label)) {
                 for (drop.paths) |path| try self.dispatchSystemOpen(runtime, drop.window_id, path, 0);
@@ -4508,7 +4815,12 @@ const AppHost = struct {
         self.publishPreviewFiles();
         if (self.ui.model.terminal_open_requested) try self.openTerminalLinkPath(runtime);
         if (self.ui.model.directory_picker_requested) try self.showDirectoryPicker(runtime);
-        if (self.ui.model.project_switching) try self.ui.dispatch(runtime, 1, .finish_project_switch);
+        if (self.ui.model.project_switching) {
+            if (self.ui.model.activeProject()) |project| {
+                if (project.kind == .remote and !project.layout.explorer_open) self.hydrateRemoteTabs(project) catch {};
+            }
+            try self.ui.dispatch(runtime, 1, .finish_project_switch);
+        }
         self.persistState(false);
     }
 
@@ -4528,12 +4840,12 @@ const AppHost = struct {
         if (self.ui.model.project_switching) try self.ui.dispatch(runtime, window_id, .finish_project_switch);
     }
 
-/// Hand the macOS host the files `zero://app/~preview/<slot>` may serve, one
-/// line per pane in `preview_panes` order. The host holds no root and does no
-/// path parsing: a slot resolves through this table or it resolves to nothing,
-/// so a WebView reaches exactly the files the user has open in a pane and the
-/// door closes the moment a tab does.
-extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) void;
+    /// Hand the macOS host the files `zero://app/~preview/<slot>` may serve, one
+    /// line per pane in `preview_panes` order. The host holds no root and does no
+    /// path parsing: a slot resolves through this table or it resolves to nothing,
+    /// so a WebView reaches exactly the files the user has open in a pane and the
+    /// door closes the moment a tab does.
+    extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) void;
 
     fn publishPreviewFiles(self: *AppHost) void {
         if (comptime builtin.os.tag != .macos) return;
@@ -4567,6 +4879,24 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         if (length == 0 or length > storage.len) return;
         @memcpy(storage[0..length], self.ui.model.terminal_open_path_buffer[0..length]);
         const path = storage[0..length];
+        if (remote.isRemote(path)) {
+            const project = self.ui.model.activeProject() orelse return;
+            if (project.kind != .remote or !std.mem.startsWith(u8, path, project.path())) return;
+            const prefix = project.path().len;
+            const separator: usize = if (std.mem.endsWith(u8, project.path(), "/")) 0 else 1;
+            if (path.len <= prefix + separator or (separator == 1 and path[prefix] != '/')) return;
+            const relative = path[prefix + separator ..];
+            if (!isSafeRelativePath(relative)) return;
+            const refusal = try self.projectOpenRefusal(project, relative, path);
+            if (refusal != .none) {
+                try self.ui.dispatch(runtime, 1, .{ .show_unsupported_file = .{ .path = path, .reason = refusal } });
+                return;
+            }
+            const markdown = if (fileKind(relative) == .markdown) try self.readProjectFile(project, relative, bridge_file_limit) else try std.heap.page_allocator.alloc(u8, 0);
+            defer std.heap.page_allocator.free(markdown);
+            try self.ui.dispatch(runtime, 1, .{ .open_file = .{ .project_id = self.ui.model.active_project_id, .path = relative, .line = line, .markdown = markdown } });
+            return;
+        }
         const stat = std.Io.Dir.cwd().statFile(self.io, path, .{}) catch return;
         if (stat.kind != .file) return;
         try self.dispatchSystemOpen(runtime, 1, path, line);
@@ -4580,6 +4910,13 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
     fn stopFn(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const self: *AppHost = @ptrCast(@alignCast(context));
         self.persistState(true);
+        if (self.remote_job) |job| {
+            if (job.thread) |thread| thread.join();
+            if (job.client) |*client| client.deinit();
+            std.heap.page_allocator.destroy(job);
+            self.remote_job = null;
+        }
+        self.remote_clients.deinit();
         self.runtime = null;
         try self.base.stop(runtime);
     }
@@ -4587,6 +4924,99 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
     fn replayFn(context: *anyopaque, control: native_sdk.runtime.ReplayControl) anyerror!void {
         const self: *AppHost = @ptrCast(@alignCast(context));
         try self.base.replayControl(control);
+    }
+
+    fn serviceRemoteConnection(self: *AppHost) !void {
+        if (self.remote_job) |job| {
+            if (job.done.load(.acquire)) {
+                if (job.thread) |thread| thread.join();
+                if (job.client) |client| self.remote_clients.adopt(client) catch {
+                    var unused = client;
+                    unused.deinit();
+                };
+                std.heap.page_allocator.destroy(job);
+                self.remote_job = null;
+            }
+        }
+        // Connections are keyed by URL, so closing/reordering project ids cannot
+        // route an editor to the session previously occupying that numeric id.
+        for (&self.remote_clients.clients) |*slot| if (slot.*) |*client| {
+            if (self.ui.model.findProject(std.mem.sliceTo(&client.uri, 0)) == null and !self.ui.model.remote_connecting) {
+                client.deinit();
+                slot.* = null;
+            }
+        };
+        if (!self.ui.model.remote_connect_requested or self.remote_job != null) return;
+        self.ui.model.remote_connect_requested = false;
+        const channel = self.ui.effects.channelHandle(remote_channel_key) orelse return;
+        if (!channel.live()) return;
+        const job = try std.heap.page_allocator.create(RemoteConnectJob);
+        job.* = .{ .channel = channel };
+        const uri = self.ui.model.remote_url_buffer.text();
+        const home = self.ui.model.homePath();
+        @memcpy(job.uri[0..uri.len], uri);
+        @memcpy(job.home[0..@min(home.len, job.home.len - 1)], home[0..@min(home.len, job.home.len - 1)]);
+        job.thread = std.Thread.spawn(.{}, RemoteConnectJob.run, .{job}) catch {
+            _ = channel.post("0Could not start the SSH connection worker. Please retry.");
+            std.heap.page_allocator.destroy(job);
+            return;
+        };
+        self.remote_job = job;
+    }
+
+    fn remoteClient(self: *AppHost, project: *const ProjectState) !*remote.Client {
+        if (project.kind != .remote) return error.InvalidProject;
+        var message: [512]u8 = @splat(0);
+        const client = self.remote_clients.get(project.path(), self.ui.model.homePath(), &message) catch |err| {
+            if (self.runtime) |runtime| self.ui.dispatch(runtime, 1, .{ .remote_error_message = if (message[0] != 0) std.mem.sliceTo(&message, 0) else @errorName(err) }) catch {};
+            return err;
+        };
+        self.ui.model.remote_error_buffer.clear();
+        return client;
+    }
+
+    fn hydrateRemoteTabs(self: *AppHost, project: *ProjectState) !void {
+        var changed = false;
+        for (&project.layout.file_tabs) |*tab| {
+            if (!tab.used or tab.remote_loaded or tab.dirty) continue;
+            if (tab.kind == .markdown) {
+                const content = try self.readProjectFile(project, tab.path(), bridge_file_limit);
+                defer std.heap.page_allocator.free(content);
+                tab.setMarkdown(content);
+            } else if (tab.kind == .image or tab.kind == .pdf) {
+                var buffer: [2048]u8 = undefined;
+                const absolute = try fullPath(project, tab.path(), &buffer);
+                _ = try self.projectOpenRefusal(project, tab.path(), absolute);
+            }
+            tab.remote_loaded = true;
+            changed = true;
+        }
+        if (changed) if (self.runtime) |runtime| try self.ui.dispatch(runtime, 1, .remote_surfaces_ready);
+    }
+
+    fn readProjectFile(self: *AppHost, project: *const ProjectState, path: []const u8, limit: usize) ![]u8 {
+        if (project.kind == .remote) return (try self.remoteClient(project)).read(path, limit);
+        var buffer: [bridge_path_capacity]u8 = undefined;
+        return std.Io.Dir.cwd().readFileAlloc(self.io, try fullPath(project, path, &buffer), std.heap.page_allocator, .limited(limit));
+    }
+
+    fn projectOpenRefusal(self: *AppHost, project: *const ProjectState, path: []const u8, absolute: []const u8) !UnsupportedReason {
+        const kind = fileKind(path);
+        if (project.kind != .remote) return openRefusal(self.io, absolute, kind);
+        const preview = kind == .image or kind == .pdf;
+        const content = self.readProjectFile(project, path, if (preview) 16 * 1024 * 1024 else bridge_file_limit) catch |err| {
+            if (err == error.FileTooLarge) return .too_large;
+            return err;
+        };
+        defer std.heap.page_allocator.free(content);
+        if (!preview) return if (looksBinary(content)) .binary else .none;
+        var buffer: [2048]u8 = undefined;
+        const cache = try remotePreviewPath(&self.ui.model, project, path, &buffer);
+        if (std.fs.path.dirname(cache)) |directory| try std.Io.Dir.cwd().createDirPath(self.io, directory);
+        const file = try std.Io.Dir.cwd().createFile(self.io, cache, .{ .permissions = .fromMode(0o600) });
+        defer file.close(self.io);
+        try file.writeStreamingAll(self.io, content);
+        return .none;
     }
 
     fn showDirectoryPicker(self: *AppHost, runtime: *native_sdk.Runtime) anyerror!void {
@@ -4667,10 +5097,11 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
 
     const ActiveProject = struct { id: u32, project: *ProjectState };
 
-    fn activeBridgeProject(self: *AppHost) !ActiveProject {
-        const project_id = self.ui.model.active_project_id;
-        if (project_id == 0 or project_id > self.ui.model.project_count) return error.UnknownProject;
-        return .{ .id = project_id, .project = &self.ui.model.projects[project_id - 1] };
+    fn activeBridgeProject(self: *AppHost, invocation: native_sdk.bridge.Invocation) !ActiveProject {
+        if (!std.mem.eql(u8, invocation.source.webview_label, tree_view_label)) return error.InvalidBridgeSource;
+        const parsed = try std.json.parseFromSlice(struct { projectId: u32 }, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        return .{ .id = parsed.value.projectId, .project = try self.validateBridgeProject(parsed.value.projectId) };
     }
 
     fn listTree(context: *anyopaque, invocation: native_sdk.bridge.Invocation, output: []u8) anyerror![]const u8 {
@@ -4678,8 +5109,18 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         if (!std.mem.eql(u8, invocation.source.webview_label, tree_view_label)) return error.InvalidBridgeSource;
         const parsed = try std.json.parseFromSlice(BridgeTreePage, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        const active = try self.activeBridgeProject();
+        const active = try self.activeBridgeProject(invocation);
         if (active.project.kind == .external_files) return writeExternalTreeJson(&self.ui.model, parsed.value.offset, output);
+        if (active.project.kind == .remote) {
+            const client = try self.remoteClient(active.project);
+            if (parsed.value.offset == 0) {
+                self.hydrateRemoteTabs(active.project) catch {};
+                if (client.tree) |*tree| tree.deinit();
+                client.tree = null;
+                client.tree = try client.list("", true);
+            }
+            return writeRemoteTreeJson(active.project.path(), &(client.tree orelse return error.InvalidTreeOffset), parsed.value.offset, output);
+        }
         return writeProjectTreeJson(self.io, active.project.path(), parsed.value.offset, output);
     }
 
@@ -4689,7 +5130,7 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         const parsed = try std.json.parseFromSlice(BridgePath, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         if (!isSafeRelativePath(parsed.value.path) or std.mem.endsWith(u8, parsed.value.path, "/")) return error.InvalidPath;
-        const active = try self.activeBridgeProject();
+        const active = try self.activeBridgeProject(invocation);
         const project = active.project;
         var absolute_buffer: [2048]u8 = undefined;
         const open_path = if (project.kind == .external_files)
@@ -4700,14 +5141,14 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         const runtime = self.runtime orelse return error.RuntimeNotReady;
         // A tab full of mojibake is worse than no tab: refuse before one is
         // opened and let the dialog say why.
-        const refusal = openRefusal(self.io, absolute, fileKind(open_path));
+        const refusal = try self.projectOpenRefusal(project, open_path, absolute);
         if (refusal != .none) {
             try self.ui.dispatch(runtime, invocation.source.window_id, .{ .show_unsupported_file = .{ .path = absolute, .reason = refusal } });
             return writeOpenedJson(output, false);
         }
         var markdown: []u8 = &.{};
         if (fileKind(open_path) == .markdown) {
-            markdown = std.Io.Dir.cwd().readFileAlloc(self.io, absolute, std.heap.page_allocator, .limited(markdown_capacity)) catch &.{};
+            markdown = self.readProjectFile(project, open_path, bridge_file_limit) catch &.{};
         }
         defer if (markdown.len > 0) std.heap.page_allocator.free(markdown);
         try self.ui.dispatch(runtime, invocation.source.window_id, .{ .open_file = .{
@@ -4726,7 +5167,7 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         const parsed = try std.json.parseFromSlice(BridgeDropPath, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         if (!isSafeRelativePath(parsed.value.path) or std.mem.endsWith(u8, parsed.value.path, "/")) return error.InvalidPath;
-        const active = try self.activeBridgeProject();
+        const active = try self.activeBridgeProject(invocation);
         const project = active.project;
         var absolute_buffer: [bridge_path_capacity]u8 = undefined;
         const open_path = if (project.kind == .external_files)
@@ -4737,16 +5178,16 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         const runtime = self.runtime orelse return error.RuntimeNotReady;
         // A drop onto a terminal types the path and needs no reader, but a
         // drop onto a pane opens a tab, so it answers to the same refusal.
-        const refusal = openRefusal(self.io, absolute, fileKind(open_path));
+        const refusal = try self.projectOpenRefusal(project, open_path, absolute);
         var markdown: []u8 = &.{};
         if (fileKind(open_path) == .markdown) {
-            markdown = std.Io.Dir.cwd().readFileAlloc(self.io, absolute, std.heap.page_allocator, .limited(markdown_capacity)) catch &.{};
+            markdown = self.readProjectFile(project, open_path, bridge_file_limit) catch &.{};
         }
         defer if (markdown.len > 0) std.heap.page_allocator.free(markdown);
         try self.ui.dispatch(runtime, invocation.source.window_id, .{ .drop_file = .{
             .project_id = active.id,
             .path = open_path,
-            .absolute = absolute,
+            .absolute = if (project.kind == .remote) try remoteAbsolutePath(project, open_path, &absolute_buffer) else absolute,
             .markdown = markdown,
             .x = parsed.value.x,
             .y = parsed.value.y,
@@ -4759,8 +5200,8 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
 
     fn treeProject(self: *AppHost, invocation: native_sdk.bridge.Invocation) !ActiveProject {
         if (!std.mem.eql(u8, invocation.source.webview_label, tree_view_label)) return error.InvalidBridgeSource;
-        const active = try self.activeBridgeProject();
-        if (active.project.kind != .folder) return error.ReadOnlyProject;
+        const active = try self.activeBridgeProject(invocation);
+        if (active.project.kind == .external_files) return error.ReadOnlyProject;
         return active;
     }
 
@@ -4770,7 +5211,7 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         defer parsed.deinit();
         const active = try self.treeProject(invocation);
         if (!isSafeRelativePath(parsed.value.path)) return error.InvalidPath;
-        try createProjectEntry(self.io, active.project, parsed.value.path, parsed.value.directory);
+        if (active.project.kind == .remote) try (try self.remoteClient(active.project)).create(parsed.value.path, parsed.value.directory) else try createProjectEntry(self.io, active.project, parsed.value.path, parsed.value.directory);
         return native_sdk.bridge.writeJsonStringValue(output, trimTreePath(parsed.value.path));
     }
 
@@ -4780,7 +5221,7 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         defer parsed.deinit();
         const active = try self.treeProject(invocation);
         if (!isSafeRelativePath(parsed.value.from) or !isSafeRelativePath(parsed.value.to)) return error.InvalidPath;
-        try moveProjectEntry(self.io, active.project, parsed.value.from, parsed.value.to);
+        if (active.project.kind == .remote) try (try self.remoteClient(active.project)).move(parsed.value.from, parsed.value.to) else try moveProjectEntry(self.io, active.project, parsed.value.from, parsed.value.to);
         const runtime = self.runtime orelse return error.RuntimeNotReady;
         try self.ui.dispatch(runtime, invocation.source.window_id, .{ .path_moved = .{
             .project_id = active.id,
@@ -4796,7 +5237,7 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         defer parsed.deinit();
         const active = try self.treeProject(invocation);
         if (!isSafeRelativePath(parsed.value.path)) return error.InvalidPath;
-        try deleteProjectEntry(self.io, active.project, parsed.value.path);
+        if (active.project.kind == .remote) try (try self.remoteClient(active.project)).remove(parsed.value.path) else try deleteProjectEntry(self.io, active.project, parsed.value.path);
         const runtime = self.runtime orelse return error.RuntimeNotReady;
         try self.ui.dispatch(runtime, invocation.source.window_id, .{ .path_deleted = .{
             .project_id = active.id,
@@ -4819,7 +5260,7 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
             break :blk folder;
         } else std.fs.path.dirname(trimTreePath(parsed.value.path)) orelse "";
         var copy_buffer: [relative_path_capacity]u8 = undefined;
-        const created = try copyProjectEntry(self.io, active.project, parsed.value.path, destination, &copy_buffer);
+        const created = if (active.project.kind == .remote) try copyRemoteEntry(try self.remoteClient(active.project), parsed.value.path, destination, &copy_buffer) else try copyProjectEntry(self.io, active.project, parsed.value.path, destination, &copy_buffer);
         return native_sdk.bridge.writeJsonStringValue(output, created);
     }
 
@@ -4828,7 +5269,7 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         if (!std.mem.eql(u8, invocation.source.webview_label, tree_view_label)) return error.InvalidBridgeSource;
         const parsed = try std.json.parseFromSlice(BridgeCopyPath, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
-        const active = try self.activeBridgeProject();
+        const active = try self.activeBridgeProject(invocation);
         if (!isSafeRelativePath(parsed.value.path)) return error.InvalidPath;
         const relative = trimTreePath(parsed.value.path);
         var absolute_buffer: [2048]u8 = undefined;
@@ -4849,7 +5290,8 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         const parsed = try std.json.parseFromSlice(BridgePath, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         if (!isSafeRelativePath(parsed.value.path)) return error.InvalidPath;
-        const active = try self.activeBridgeProject();
+        const active = try self.activeBridgeProject(invocation);
+        if (active.project.kind == .remote) return error.RemoteFilesAreNotInFinder;
         var absolute_buffer: [bridge_path_capacity]u8 = undefined;
         const absolute = if (active.project.kind == .external_files)
             (externalFileForTreeName(&self.ui.model, parsed.value.path) orelse return error.InvalidPath).path()
@@ -4865,6 +5307,7 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         const parsed = try std.json.parseFromSlice(BridgeSearchRequest, std.heap.page_allocator, invocation.request.payload, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const active = try self.treeProject(invocation);
+        if (active.project.kind == .remote) return writeRemoteSearchJson(try self.remoteClient(active.project), parsed.value, output);
         return writeSearchJson(self.io, active.project.path(), parsed.value, output);
     }
 
@@ -4881,7 +5324,7 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         if (!tab.used or tab.kind == .pdf) return error.UnknownTab;
         var absolute_buffer: [2048]u8 = undefined;
         const absolute = try fullPath(project, tab.path(), &absolute_buffer);
-        const content = try std.Io.Dir.cwd().readFileAlloc(self.io, absolute, std.heap.page_allocator, .limited(bridge_file_limit));
+        const content = try self.readProjectFile(project, tab.path(), bridge_file_limit);
         defer std.heap.page_allocator.free(content);
         var writer: std.Io.Writer = .fixed(output);
         try std.json.Stringify.value(.{ .path = absolute, .relativePath = tab.path(), .content = content }, .{}, &writer);
@@ -4900,7 +5343,7 @@ extern fn native_sdk_appkit_set_preview_files(bytes: [*]const u8, len: usize) vo
         if (!tab.used or tab.kind == .image or tab.kind == .pdf) return error.UnknownTab;
         var absolute_buffer: [2048]u8 = undefined;
         const absolute = try fullPath(project, tab.path(), &absolute_buffer);
-        try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = absolute, .data = parsed.value.content });
+        if (project.kind == .remote) try (try self.remoteClient(project)).write(tab.path(), parsed.value.content, false) else try std.Io.Dir.cwd().writeFile(self.io, .{ .sub_path = absolute, .data = parsed.value.content });
         const runtime = self.runtime orelse return error.RuntimeNotReady;
         try self.ui.dispatch(runtime, invocation.source.window_id, .{ .markdown_saved = .{
             .project_id = parsed.value.projectId,
@@ -5019,6 +5462,43 @@ fn writeExternalTreeJson(model: *const Model, offset: usize, output: []u8) ![]co
     try writer.writeAll(if (index >= count) "true" else "false");
     try writer.writeAll(",\"truncated\":false,\"skipped\":0,\"editable\":false}");
     return writer.buffered();
+}
+
+fn writeRemoteTreeJson(uri: []const u8, listing: *const remote.Listing, offset: usize, output: []u8) ![]const u8 {
+    if (offset > listing.entries.items.len) return error.InvalidTreeOffset;
+    var writer: std.Io.Writer = .fixed(output);
+    try writer.writeAll("{\"root\":");
+    try std.json.Stringify.value(uri, .{}, &writer);
+    try writer.writeAll(",\"paths\":[");
+    var index = offset;
+    while (index < listing.entries.items.len and index - offset < bridge_tree_page_limit) {
+        const entry = listing.entries.items[index];
+        var path_buffer: [relative_path_capacity]u8 = undefined;
+        const path = if (entry.directory) try std.fmt.bufPrint(&path_buffer, "{s}/", .{entry.path}) else entry.path;
+        var encoded_buffer: [relative_path_capacity * 6 + 2]u8 = undefined;
+        var encoded_writer: std.Io.Writer = .fixed(&encoded_buffer);
+        try std.json.Stringify.value(path, .{}, &encoded_writer);
+        const encoded = encoded_writer.buffered();
+        if (writer.buffered().len + encoded.len + 160 > @min(output.len, bridge_tree_page_budget)) break;
+        if (index > offset) try writer.writeByte(',');
+        try writer.writeAll(encoded);
+        index += 1;
+    }
+    try writer.print("],\"nextOffset\":{d},\"done\":{s},\"truncated\":{s},\"skipped\":{d},\"editable\":true}}", .{
+        index, if (index >= listing.entries.items.len) "true" else "false", if (listing.truncated) "true" else "false", listing.skipped,
+    });
+    return writer.buffered();
+}
+
+fn copyRemoteEntry(client: *remote.Client, path: []const u8, destination: []const u8, output: []u8) ![]const u8 {
+    const source = trimTreePath(path);
+    for (0..1000) |attempt| {
+        const candidate = try copyCandidatePath(trimTreePath(destination), std.fs.path.basename(source), attempt, output);
+        if (client.stat(candidate)) |_| continue else |err| if (err != error.FileNotFound) return err;
+        try client.copy(source, candidate);
+        return candidate;
+    }
+    return error.PathAlreadyExists;
 }
 
 fn writeProjectTreeJson(io: std.Io, project_path: []const u8, offset: usize, output: []u8) ![]const u8 {
@@ -5494,6 +5974,77 @@ fn writeSearchJson(io: std.Io, project_path: []const u8, request: BridgeSearchRe
     return writer.buffered();
 }
 
+fn writeRemoteSearchJson(client: *remote.Client, request: BridgeSearchRequest, output: []u8) ![]const u8 {
+    if (request.query.len == 0 or request.query.len > search_max_query_bytes) return error.InvalidSearchQuery;
+    if (client.tree == null or (request.fileOffset == 0 and request.matchOffset == 0)) {
+        if (client.tree) |*tree| tree.deinit();
+        client.tree = null;
+        client.tree = try client.list("", true);
+    }
+    var writer: std.Io.Writer = .fixed(output);
+    try writer.writeAll("{\"matches\":[");
+    var file_index: usize = 0;
+    var next_file = request.fileOffset;
+    var next_match = request.matchOffset;
+    var scanned: usize = 0;
+    var skipped: usize = client.tree.?.skipped;
+    var first = true;
+    var done = true;
+    walk: for (client.tree.?.entries.items) |entry| {
+        if (entry.directory or !searchPathAllowed(entry.path, request.include, request.exclude)) continue;
+        const current = file_index;
+        file_index += 1;
+        if (current < request.fileOffset) continue;
+        if (scanned >= 32) {
+            done = false;
+            break;
+        }
+        scanned += 1;
+        const content = client.read(entry.path, search_max_file_bytes) catch {
+            skipped += 1;
+            next_file = current + 1;
+            next_match = 0;
+            continue;
+        };
+        defer std.heap.page_allocator.free(content);
+        if (!looksBinary(content)) {
+            const skip_matches = if (current == request.fileOffset) request.matchOffset else 0;
+            var ordinal: usize = 0;
+            var line_number: u32 = 0;
+            var lines = std.mem.splitScalar(u8, content, '\n');
+            file: while (lines.next()) |raw_line| {
+                line_number += 1;
+                const line = std.mem.trimEnd(u8, raw_line, "\r");
+                var from: usize = 0;
+                while (findSearchMatch(line, request.query, request.matchCase, request.wholeWord, from)) |at| {
+                    from = at + request.query.len;
+                    if (ordinal >= search_max_matches_per_file) break :file;
+                    const match_ordinal = ordinal;
+                    ordinal += 1;
+                    if (match_ordinal < skip_matches) continue;
+                    const preview = searchPreview(line, at, request.query.len);
+                    var encoded_buffer: [(search_max_line_bytes + search_max_query_bytes) * 6 + relative_path_capacity * 6 + 160]u8 = undefined;
+                    var encoded: std.Io.Writer = .fixed(&encoded_buffer);
+                    try std.json.Stringify.value(SearchMatchJson{ .path = entry.path, .line = line_number, .before = preview.before, .match = preview.match, .after = preview.after }, .{}, &encoded);
+                    if (writer.buffered().len + encoded.buffered().len + 160 > @min(output.len, bridge_tree_page_budget)) {
+                        next_file = current;
+                        next_match = match_ordinal;
+                        done = false;
+                        break :walk;
+                    }
+                    if (!first) try writer.writeByte(',');
+                    first = false;
+                    try writer.writeAll(encoded.buffered());
+                }
+            }
+        }
+        next_file = current + 1;
+        next_match = 0;
+    }
+    try writer.print("],\"nextFileOffset\":{d},\"nextMatchOffset\":{d},\"done\":{s},\"skipped\":{d}}}", .{ next_file, next_match, if (done) "true" else "false", skipped });
+    return writer.buffered();
+}
+
 // The on-disk shape of a restored workspace. These field names ARE the file
 // format: renaming one is a format change and `session_version` moves with it.
 // Unknown fields are ignored on read, so a file written by a newer build still
@@ -5646,7 +6197,7 @@ fn restoreSessionTab(model: *Model, project_id: u32, entry: SessionTab, io: std.
         if (paneForTab(layout, id) != null) return null;
         return id;
     }
-    if (project.kind == .folder) {
+    if (project.kind != .external_files) {
         if (!isSafeRelativePath(entry.path)) return null;
     } else if (!std.fs.path.isAbsolute(entry.path) or externalFileIndex(model, entry.path) == null) {
         return null;
@@ -5654,7 +6205,7 @@ fn restoreSessionTab(model: *Model, project_id: u32, entry: SessionTab, io: std.
     if (findFileSlot(layout, entry.path) != null) return null;
     var absolute_buffer: [bridge_path_capacity]u8 = undefined;
     const absolute = fullPath(project, entry.path, &absolute_buffer) catch return null;
-    if (!entryExists(io, absolute)) return null;
+    if (project.kind != .remote and !entryExists(io, absolute)) return null;
     const slot = availableFileSlot(layout) orelse return null;
     const tab = &layout.file_tabs[slot];
     tab.setPath(entry.path);
@@ -5662,7 +6213,7 @@ fn restoreSessionTab(model: *Model, project_id: u32, entry: SessionTab, io: std.
         // The reading surface renders from the tab's own copy of the file, and
         // nothing has read this one yet.
         var markdown: []u8 = &.{};
-        markdown = std.Io.Dir.cwd().readFileAlloc(io, absolute, std.heap.page_allocator, .limited(markdown_capacity)) catch &.{};
+        if (project.kind != .remote) markdown = std.Io.Dir.cwd().readFileAlloc(io, absolute, std.heap.page_allocator, .limited(markdown_capacity)) catch &.{};
         defer if (markdown.len > 0) std.heap.page_allocator.free(markdown);
         tab.setMarkdown(markdown);
         tab.markdown_editor_visible = entry.markdown_editor;
@@ -5710,6 +6261,9 @@ fn applySessionJson(model: *Model, io: std.Io, text: []const u8) void {
         var project_id: u32 = 0;
         if (entry.kind == .external_files) {
             project_id = ensureExternalProject(model) orelse continue;
+        } else if (entry.kind == .remote) {
+            if (!remote.isRemote(entry.path)) continue;
+            project_id = addProject(model, entry.path) orelse continue;
         } else {
             if (!std.fs.path.isAbsolute(entry.path) or !directoryExists(io, entry.path)) continue;
             project_id = addProject(model, entry.path) orelse continue;
@@ -5821,6 +6375,11 @@ fn loadPreferences(model: *Model, io: std.Io, path: []const u8) void {
 }
 
 fn resolveAppDataFile(init: std.process.Init, name: []const u8, output: []u8) ?[]const u8 {
+    if (init.environ_map.get("DOCYRUS_OPEN_IDE_E2E_STATE_DIR")) |directory| {
+        if (!std.fs.path.isAbsolute(directory)) return null;
+        std.Io.Dir.cwd().createDirPath(init.io, directory) catch return null;
+        return std.fmt.bufPrint(output, "{s}/{s}", .{ directory, name }) catch null;
+    }
     var directory_buffer: [768]u8 = undefined;
     const directory = native_sdk.app_dirs.resolveOne(
         .{ .name = bundle_id },

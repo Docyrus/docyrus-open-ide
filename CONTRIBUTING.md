@@ -19,6 +19,7 @@ the `system` team.
   Windows build.
 - **Node.js 24 or newer** (`@native-sdk/cli` sets `engines.node >= 24`).
 - **Xcode Command Line Tools** — `xcode-select --install`.
+- **Homebrew OpenSSL 3** — `brew install openssl@3`, linked statically for SSH/SFTP.
 
 You do **not** need to install Zig yourself. The Native SDK fetches its pinned
 Zig 0.16 toolchain into `~/.native/toolchains/` on the first build, and the npm
@@ -34,11 +35,11 @@ npm install
 npm run dev
 ```
 
-`npm install` runs `postinstall` → `scripts/patch-native-sdk-pointer.mjs`, which
-patches the installed SDK's cursor behaviour inside `node_modules`. If that
-script throws `The installed Native SDK cursor implementation changed`, the
-pinned SDK version moved and the patch needs updating — say so in an issue
-rather than deleting the script.
+`npm install` runs `postinstall` → `npm run patch:native-sdk`, which applies the
+compatibility patches in `scripts/patch-native-sdk-*.mjs` inside `node_modules`.
+If a script reports that the installed SDK implementation changed, the pinned
+SDK version moved and that patch needs updating — say so in an issue rather
+than deleting the script.
 
 The first build with terminals enabled fetches the pinned Ghostty dependency and
 can take several minutes.
@@ -72,7 +73,7 @@ points that bite newcomers:
   Never edit it by hand. `frontend/dist/editor.js` and `editor.css`, by
   contrast, *are* the sources and are edited in place.
 - **`frontend/dist/vs/` is vendored Monaco.** Leave it alone; upgrade it by
-  bumping `monaco-editor` and recopying.
+  bumping `monaco-editor` and running `npm run vendor:monaco`.
 - **Model state uses fixed-size buffers.** Widen a `*_capacity` / `max_*`
   constant rather than introducing dynamic allocation.
 - **A new bridge command must be added in three places** — `app.json`

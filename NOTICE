@@ -17,6 +17,8 @@ This product bundles or depends on third-party software:
 - Monaco Editor (monaco-editor), vendored under frontend/dist/vs — MIT License
 - @pierre/trees — Apache License 2.0
 - Ghostty (terminal backend, fetched at build time) — MIT License
+- libssh2 (native SSH/SFTP client, pinned at build time) — BSD 3-Clause; license in assets/licenses/libssh2.txt
+- OpenSSL 3 (statically linked cryptography) — Apache License 2.0; license in assets/licenses/openssl.txt
 - Zig toolchain (build-time only) — MIT License
 
 Each retains its own copyright and license terms.

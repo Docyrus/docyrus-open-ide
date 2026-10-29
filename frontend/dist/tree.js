@@ -9421,6 +9421,7 @@
   var tree;
   var treeRootLabel = "project";
   var treeEditable = false;
+  var treeRemote = false;
   var lastOpenedPath = "";
   var clipboardPath = null;
   var clipboardKey = `docyrus:explorer-clipboard:${projectId}`;
@@ -9478,7 +9479,7 @@
   }
   async function invoke(command, payload) {
     if (!window.zero?.invoke) throw new Error("Native bridge is unavailable");
-    return window.zero.invoke(command, payload);
+    return window.zero.invoke(command, { ...payload, projectId });
   }
   function messageFrom(error, fallback) {
     return error instanceof Error && error.message ? error.message : fallback;
@@ -9820,7 +9821,7 @@
       { label: "Copy Path", run: () => copyPathToClipboard(path, true) },
       { label: "Copy Relative Path", run: () => copyPathToClipboard(path, false) },
       { separator: true },
-      { label: "Reveal in Finder", run: () => revealInFinder(path) },
+      { label: "Reveal in Finder", disabled: treeRemote, run: () => revealInFinder(path) },
       { separator: true },
       { label: "Delete", destructive: true, handoff: true, run: () => deleteEntry(path) }
     ];
@@ -9934,6 +9935,7 @@
     try {
       const { paths, root, editable, skipped, truncated } = await loadTreePaths();
       treeEditable = editable;
+      treeRemote = /^(ssh|sftp):\/\//.test(root);
       treeRootLabel = basenameOf(root) || root || "project";
       updateFileActionAvailability();
       tree?.cleanUp();
@@ -9969,7 +9971,7 @@
       const stored = readStoredClipboard();
       setClipboardPath(stored && tree.getItem(stored) ? stored : null);
       const notes = [];
-      if (truncated) notes.push("showing first 1,200");
+      if (truncated) notes.push(`showing first ${paths.length.toLocaleString()}`);
       if (skipped > 0) notes.push(`${skipped} inaccessible skipped`);
       setStatus(
         paths.length === 0 ? `No files in ${root}` : `${paths.length} items in ${root}${notes.length ? ` \u2022 ${notes.join(" \u2022 ")}` : ""}`

@@ -13,11 +13,12 @@ Apple Silicon Macs can install the latest release with one command:
 curl -fsSL https://github.com/Docyrus/docyrus-open-ide/releases/latest/download/install-mac.sh | bash
 ```
 
-The installer places `Docyrus Open IDE.app` in `/Applications`, clears the downloaded quarantine attribute for this unsigned preview, and opens the app.
+The installer verifies the pinned SHA-256 checksum and the Docyrus Developer ID signature, places `Docyrus Open IDE.app` in `/Applications`, clears the downloaded quarantine attribute, and opens the app.
 
 ## Features
 
 - Add project folders with the native macOS directory picker.
+- Add SSH/SFTP project folders, edit remote files, and open interactive SSH terminals.
 - Reopen up to ten recent projects from the Add Project dialog.
 - Keep a completely independent pane layout, tabs, split mode, explorer state, and terminal pair for each open project.
 - Reorder tabs or move them between panes with drag and drop.
@@ -28,7 +29,7 @@ The installer places `Docyrus Open IDE.app` in `/Applications`, clears the downl
 
 ## Develop
 
-You need macOS on Apple Silicon, Node.js 24 or newer, and the Xcode Command Line Tools. You do not need to install Zig: the Native SDK fetches its pinned Zig 0.16 toolchain into `~/.native/toolchains/` on the first build (it asks before downloading), and the npm scripts put it on `PATH`.
+You need macOS on Apple Silicon, Node.js 24 or newer, the Xcode Command Line Tools, and Homebrew OpenSSL 3 (`brew install openssl@3`). OpenSSL is linked statically; people installing the packaged app do not need Homebrew. You do not need to install Zig: the Native SDK fetches its pinned Zig 0.16 toolchain into `~/.native/toolchains/` on the first build (it asks before downloading), and the npm scripts put it on `PATH`.
 
 ```sh
 npm install
@@ -46,6 +47,20 @@ npm run build
 ```
 
 The app deliberately starts without an open project. Use the plus button in the project rail to select a folder.
+
+## Remote projects
+
+Open **Add Project**, enter `ssh://user@host:22/absolute/project/folder` or `sftp://user@host/absolute/project/folder`, and choose **Connect Folder**. IPv6 addresses use brackets, for example `sftp://user@[::1]:2222/home/user/project`. Percent-encode special path characters (`%20` for a space). Both schemes use SFTP for file access and SSH for terminals.
+
+SFTP authenticates through your running SSH agent. Load a key with `ssh-add ~/.ssh/id_ed25519` first; encrypted keys remain in the agent. Host identity is checked against `~/.ssh/known_hosts` before authentication. For a new server, choose **Open SSH Terminal**, verify its fingerprint against a trusted source, and accept it in OpenSSH. Then refresh the explorer or reconnect. A changed host key is rejected. The SSH terminal also supports OpenSSH's interactive password and keyboard-interactive prompts; SFTP file access currently requires an agent key. Connection URLs never contain passwords.
+
+Remote projects support the explorer, text/Markdown editing and search, create/rename/copy/delete, and image/PDF previews. Connections and tabs survive restart; the app reconnects when the files are needed. Terminals start in the remote project folder. Use explicit hostnames, usernames, and ports: SFTP does not interpret SSH config aliases, ProxyJump, or custom identity-file settings. Load those identities into the agent instead.
+
+Remote text editing and copies are capped at 768 KiB per file; image/PDF previews at 16 MiB. Explorer snapshots contain up to 4,096 entries and 32 directory levels and indicate incomplete results. Symlinks are omitted and refused by file operations. Recursive copy/delete refuses an incomplete subtree. Saves upload to a sibling temporary file and require the server's `posix-rename@openssh.com` extension, preserving the existing file if upload/rename fails. Preview downloads are stored in the app's macOS cache directory with private file permissions.
+
+The native client uses [libssh2](https://github.com/libssh2/libssh2), pinned to upstream revision `94629f16bb313e522276b53a50f8d89c6eee81b0` (2026-10-28) in `build.zig.zon`, including fixes newer than release 1.11.1, plus maintained OpenSSL 3 from Homebrew. Update the pinned source URL and Zig content hash together after reviewing upstream security changes. A custom OpenSSL installation can be selected with `zig build -Dopenssl-prefix=/absolute/prefix`.
+
+`npm run test:remote` starts an isolated loopback-only OpenSSH server and agent with temporary keys. It checks real SFTP operations, hashed known-host entries, unknown/changed host rejection, traversal/symlink refusal, and upload limits. It does not change your keys, agent, known_hosts, or Remote Login settings. On macOS, run it outside a nested sandbox so sshd can initialize its own sandbox.
 
 ## Contributing
 

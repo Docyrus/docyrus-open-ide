@@ -52,12 +52,6 @@ async function invoke(command, payload) {
   return window.zero.invoke(command, payload);
 }
 
-self.MonacoEnvironment = {
-  getWorkerUrl() {
-    return "./vs/base/worker/workerMain.js";
-  },
-};
-
 applyDocumentTheme();
 if (requestedTheme === "system") systemDark.addEventListener("change", () => {
   applyDocumentTheme();

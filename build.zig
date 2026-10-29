@@ -13,12 +13,49 @@ const native_sdk = @import("native_sdk");
 
 pub fn build(b: *std.Build) void {
     const dep = b.dependency("native_sdk", .{});
-    native_sdk.addApp(b, dep, .{
+    const app = native_sdk.addAppArtifacts(b, dep, .{
         .name = "docyrus-open-ide",
         .manifest = "app.json",
         .terminal_sessions = true,
     });
+    addRemoteClient(b, app);
     addTerminalSessionTests(b, dep);
+}
+
+fn addRemoteClient(b: *std.Build, app: native_sdk.AppArtifacts) void {
+    const ssh2 = b.dependency("libssh2", .{});
+    const openssl = b.option([]const u8, "openssl-prefix", "OpenSSL 3 prefix (statically linked)") orelse "/opt/homebrew/opt/openssl@3";
+    const module = b.createModule(.{
+        .target = app.exe.root_module.resolved_target,
+        .optimize = .ReleaseSafe,
+        .link_libc = true,
+    });
+    module.addIncludePath(ssh2.path("include"));
+    module.addIncludePath(ssh2.path("src"));
+    module.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ openssl, "include" }) });
+    module.addIncludePath(b.path("src"));
+    module.addCSourceFiles(.{
+        .root = ssh2.path("src"),
+        .files = &.{ "agent.c", "bcrypt_pbkdf.c", "chacha.c", "channel.c", "cipher-chachapoly.c", "comp.c", "crypt.c", "global.c", "hostkey.c", "keepalive.c", "kex.c", "knownhost.c", "mac.c", "misc.c", "openssl.c", "packet.c", "pem.c", "poly1305.c", "publickey.c", "scp.c", "session.c", "sftp.c", "transport.c", "userauth.c", "userauth_kbd_packet.c", "version.c" },
+        .flags = &.{ "-DLIBSSH2_OPENSSL", "-DHAVE_UNISTD_H", "-DHAVE_INTTYPES_H", "-DHAVE_SYS_UN_H", "-DHAVE_SYS_UIO_H", "-DHAVE_SYS_IOCTL_H", "-DHAVE_SYS_SELECT_H", "-DHAVE_POLL", "-DHAVE_O_NONBLOCK", "-DLIBSSH2_NO_DSA", "-DLIBSSH2_NO_RSA_SHA1", "-Wno-deprecated-declarations" },
+    });
+    module.addCSourceFile(.{ .file = b.path("src/remote_client.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    const library = b.addLibrary(.{ .name = "docyrus-ssh2", .linkage = .static, .root_module = module });
+    for ([_]*std.Build.Module{ app.exe.root_module, app.tests.root_module }) |root| {
+        root.addIncludePath(b.path("src"));
+        root.linkLibrary(library);
+        root.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ openssl, "lib/libcrypto.a" }) });
+    }
+    const integration = b.addExecutable(.{ .name = "remote-integration", .root_module = b.createModule(.{
+        .root_source_file = b.path("src/remote_integration.zig"),
+        .target = app.exe.root_module.resolved_target,
+        .optimize = .Debug,
+        .link_libc = true,
+    }) });
+    integration.root_module.addIncludePath(b.path("src"));
+    integration.root_module.linkLibrary(library);
+    integration.root_module.addObjectFile(.{ .cwd_relative = b.pathJoin(&.{ openssl, "lib/libcrypto.a" }) });
+    b.step("remote-test-client", "Build the isolated SSH/SFTP integration test client").dependOn(&b.addInstallArtifact(integration, .{}).step);
 }
 
 /// The framework's terminal-session store tests only have anything to
