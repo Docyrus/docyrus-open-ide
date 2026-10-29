@@ -966,6 +966,7 @@ pub const Msg = union(enum) {
         "finish_project_switch",
         "remote_connection_event",
         "remote_error_message",
+        "remote_authentication_required",
         "remote_surfaces_ready",
     };
 
@@ -1021,6 +1022,7 @@ pub const Msg = union(enum) {
     open_connection_terminal,
     remote_connection_event: native_sdk.EffectChannelEvent,
     remote_error_message: []const u8,
+    remote_authentication_required: []const u8,
     remote_surfaces_ready,
     open_recent_project: u32,
     remove_recent_project: u32,
@@ -2650,7 +2652,17 @@ fn openRemoteProject(model: *Model) ?u32 {
     };
     model.add_project_open = false;
     model.tree_reload_token +%= 1;
+    const was_active = model.active_project_id == id;
     selectProject(model, id);
+    if (was_active) {
+        const layout = &model.projects[id - 1].layout;
+        inline for (std.meta.tags(Pane)) |pane| {
+            if (activeFileSlot(layout, pane)) |slot| {
+                if (!layout.file_tabs[slot].dirty) bumpEditorReload(model, pane);
+            }
+        }
+        syncUrls(model);
+    }
     return id;
 }
 
@@ -2699,6 +2711,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             ensureActiveSurfaces(model, fx);
         },
         .remote_error_message => |message| model.remote_error_buffer.set(message),
+        .remote_authentication_required => |uri| {
+            if (model.remote_connecting) return;
+            model.remote_url_buffer.set(uri);
+            model.add_project_open = true;
+            beginRemoteConnection(model, fx);
+        },
         .remote_url_input => |edit| if (!model.remote_connecting) {
             model.remote_url_buffer.apply(edit);
             model.remote_error_buffer.clear();
@@ -2720,6 +2738,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.remote_connect_requested = false;
                 if (event.bytes.len > 0 and event.bytes[0] == '1') {
                     _ = openRemoteProject(model);
+                } else if (event.bytes.len > 0 and event.bytes[0] == '2') {
+                    model.remote_error_buffer.clear();
                 } else model.remote_error_buffer.set(if (event.bytes.len > 1) event.bytes[1..] else "Connection failed. Retry after checking the server.");
                 fx.closeChannel(remote_channel_key);
             },
@@ -4519,6 +4539,30 @@ test "remote connect failures keep the chooser open and success adds a project" 
     try std.testing.expectEqual(ProjectKind.remote, model.projects[0].kind);
 }
 
+test "remote password sign-in preserves project tabs and never changes the saved session" {
+    const model = try testModel();
+    defer std.testing.allocator.destroy(model);
+    const uri = "sftp://alice@host/project";
+    model.active_project_id = addProject(model, uri).?;
+    var fx = Effects.init(std.testing.allocator);
+    defer fx.deinit();
+    fx.executor = .fake;
+    openFile(model, .{ .project_id = 1, .path = "work.txt" }, &fx);
+    model.projects[0].layout.file_tabs[0].dirty = true;
+    const saved = sessionSignature(model);
+    update(model, .{ .remote_authentication_required = uri }, &fx);
+    try std.testing.expect(model.add_project_open and model.remote_connecting);
+    try std.testing.expectEqualStrings(uri, model.remote_url());
+    try std.testing.expectEqual(saved, sessionSignature(model));
+    try std.testing.expect(model.projects[0].layout.file_tabs[0].dirty);
+    update(model, .{ .remote_connection_event = .{ .key = remote_channel_key, .bytes = "2" } }, &fx);
+    try std.testing.expect(!model.remote_connecting);
+    try std.testing.expect(model.add_project_open);
+    try std.testing.expect(!model.has_remote_error());
+    try std.testing.expectEqual(saved, sessionSignature(model));
+    try std.testing.expectEqual(@as(u8, 1), model.project_count);
+}
+
 test "remote tree pages stay under the bridge limit with escaped filenames" {
     var listing: remote.Listing = .{};
     defer listing.deinit();
@@ -4714,6 +4758,9 @@ const BridgeEditorDirty = struct {
     dirty: bool,
 };
 
+extern fn docyrus_remote_auth_prompt(context: ?*anyopaque, user: [*c]const u8, host: [*c]const u8, instruction: [*c]const u8, prompt: [*c]const u8, response: [*c]u8, capacity: usize) c_int;
+extern fn docyrus_remote_cancel_auth_prompts() void;
+
 const RemoteConnectJob = struct {
     uri: [1025]u8 = @splat(0),
     home: [1024]u8 = @splat(0),
@@ -4725,7 +4772,11 @@ const RemoteConnectJob = struct {
     fn run(self: *RemoteConnectJob) void {
         var message: [512]u8 = @splat(0);
         var response: [513]u8 = @splat(0);
-        self.client = remote.Client.connect(std.mem.sliceTo(&self.uri, 0), std.mem.sliceTo(&self.home, 0), &message) catch |err| blk: {
+        self.client = remote.Client.connectWithPrompt(std.mem.sliceTo(&self.uri, 0), std.mem.sliceTo(&self.home, 0), &message, docyrus_remote_auth_prompt, null) catch |err| blk: {
+            if (err == error.AuthenticationCancelled) {
+                response[0] = '2';
+                break :blk null;
+            }
             response[0] = '0';
             const detail = if (message[0] != 0) std.mem.sliceTo(&message, 0) else @errorName(err);
             @memcpy(response[1 .. detail.len + 1], detail);
@@ -4910,6 +4961,7 @@ const AppHost = struct {
     fn stopFn(context: *anyopaque, runtime: *native_sdk.Runtime) anyerror!void {
         const self: *AppHost = @ptrCast(@alignCast(context));
         self.persistState(true);
+        docyrus_remote_cancel_auth_prompts();
         if (self.remote_job) |job| {
             if (job.thread) |thread| thread.join();
             if (job.client) |*client| client.deinit();
@@ -4968,7 +5020,9 @@ const AppHost = struct {
         if (project.kind != .remote) return error.InvalidProject;
         var message: [512]u8 = @splat(0);
         const client = self.remote_clients.get(project.path(), self.ui.model.homePath(), &message) catch |err| {
-            if (self.runtime) |runtime| self.ui.dispatch(runtime, 1, .{ .remote_error_message = if (message[0] != 0) std.mem.sliceTo(&message, 0) else @errorName(err) }) catch {};
+            if (self.runtime) |runtime| {
+                if (err == error.PasswordAuthenticationRequired) self.ui.dispatch(runtime, 1, .{ .remote_authentication_required = project.path() }) catch {} else self.ui.dispatch(runtime, 1, .{ .remote_error_message = if (message[0] != 0) std.mem.sliceTo(&message, 0) else @errorName(err) }) catch {};
+            }
             return err;
         };
         self.ui.model.remote_error_buffer.clear();
@@ -6402,6 +6456,11 @@ pub fn main(init: std.process.Init) !void {
     const initial_model = &app_state.model;
 
     if (init.environ_map.get("HOME")) |home_path| initial_model.setHomePath(home_path);
+    if (init.environ_map.get("DOCYRUS_OPEN_IDE_E2E_STATE_DIR") != null) {
+        if (init.environ_map.get("DOCYRUS_OPEN_IDE_E2E_SSH_HOME")) |test_home| {
+            if (std.fs.path.isAbsolute(test_home)) initial_model.setHomePath(test_home);
+        }
+    }
     var preferences_path: [1024]u8 = undefined;
     const resolved_preferences = resolveAppDataFile(init, "preferences.txt", &preferences_path);
     if (resolved_preferences) |path| loadPreferences(initial_model, init.io, path);

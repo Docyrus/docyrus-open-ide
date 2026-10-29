@@ -107,11 +107,19 @@ pub const Client = struct {
     tree: ?Listing = null,
 
     pub fn connect(uri: []const u8, home: []const u8, message: []u8) !Client {
+        return connectWithPrompt(uri, home, message, null, null);
+    }
+    pub fn connectWithPrompt(uri: []const u8, home: []const u8, message: []u8, prompt: c.DR_AUTH_PROMPT, context: ?*anyopaque) !Client {
         const config = try Config.parse(uri);
         var known: [2048]u8 = undefined;
         const known_hosts = try std.fmt.bufPrintZ(&known, "{s}/.ssh/known_hosts", .{home});
         if (message.len == 0) return error.InvalidBuffer;
-        const handle = c.dr_connect(&config.host, config.port, &config.user, &config.root, known_hosts, message.ptr, message.len) orelse return error.RemoteConnectionFailed;
+        var auth_status: c_int = 0;
+        const handle = c.dr_connect_auth(&config.host, config.port, &config.user, &config.root, known_hosts, prompt, context, &auth_status, message.ptr, message.len) orelse return switch (auth_status) {
+            c.DR_AUTH_REQUIRED => error.PasswordAuthenticationRequired,
+            c.DR_AUTH_CANCELLED => error.AuthenticationCancelled,
+            else => error.RemoteConnectionFailed,
+        };
         var client: Client = .{ .handle = handle };
         @memcpy(client.uri[0..uri.len], uri);
         return client;

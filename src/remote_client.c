@@ -3,6 +3,7 @@
 #include <libssh2_sftp.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -14,6 +15,8 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <time.h>
+#include <limits.h>
 
 struct DocyrusRemote {
     int socket;
@@ -21,7 +24,104 @@ struct DocyrusRemote {
     LIBSSH2_SFTP *sftp;
     char root[2048];
     char error[512];
+    DR_AUTH_PROMPT prompt;
+    void *prompt_context;
+    const char *user;
+    const char *host;
+    int auth_cancelled;
+    unsigned prompts_left;
+    unsigned rounds_left;
+    long long prompt_wait_ms;
 };
+
+/* libssh2 also copies answers into protocol packets. Wipe its allocations on
+   release, including callback responses, rather than only our input buffer. */
+typedef union { max_align_t alignment; size_t size; } SecureHeader;
+static void *secure_alloc(size_t size, void **abstract) {
+    (void)abstract;
+    if (size > SIZE_MAX - sizeof(SecureHeader)) return NULL;
+    SecureHeader *header = malloc(sizeof(*header) + size);
+    if (!header) return NULL;
+    header->size = size;
+    return header + 1;
+}
+static void secure_free(void *pointer, void **abstract) {
+    (void)abstract;
+    if (!pointer) return;
+    SecureHeader *header = (SecureHeader *)pointer - 1;
+    OPENSSL_cleanse(pointer, header->size);
+    free(header);
+}
+static void *secure_realloc(void *pointer, size_t size, void **abstract) {
+    if (!pointer) return secure_alloc(size, abstract);
+    if (!size) { secure_free(pointer, abstract); return NULL; }
+    SecureHeader *header = (SecureHeader *)pointer - 1;
+    void *replacement = secure_alloc(size, abstract);
+    if (!replacement) return NULL;
+    memcpy(replacement, pointer, header->size < size ? header->size : size);
+    secure_free(pointer, abstract);
+    return replacement;
+}
+
+static int auth_method(const char *methods, const char *method) {
+    if (!methods) return 0;
+    size_t length = strlen(method);
+    for (const char *p = methods; *p;) {
+        const char *end = strchr(p, ',');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        if (length == n && !memcmp(p, method, n)) return 1;
+        p += n;
+        if (*p) p++;
+    }
+    return 0;
+}
+
+static long long monotonic_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static void keyboard_answers(const char *name, int name_len, const char *instruction,
+                             int instruction_len, int count,
+                             const LIBSSH2_USERAUTH_KBDINT_PROMPT *prompts,
+                             LIBSSH2_USERAUTH_KBDINT_RESPONSE *responses, void **abstract) {
+    (void)name; (void)name_len;
+    DocyrusRemote *r = *abstract;
+    if (!r->rounds_left || count < 0 || count > 8 || (unsigned)count > r->prompts_left) { r->auth_cancelled = 1; shutdown(r->socket, SHUT_RDWR); return; }
+    r->rounds_left--;
+    char instructions[1025];
+    size_t length = instruction_len > 0 ? (size_t)instruction_len : 0;
+    if (length > sizeof(instructions) - 1) length = sizeof(instructions) - 1;
+    if (length) memcpy(instructions, instruction, length);
+    instructions[length] = 0;
+    for (int i = 0; i < count; i++) {
+        char question[1025], answer[4097] = {0};
+        length = prompts[i].length;
+        if (length > sizeof(question) - 1) length = sizeof(question) - 1;
+        memcpy(question, prompts[i].text, length);
+        question[length] = 0;
+        r->prompts_left--;
+        long long before = monotonic_ms();
+        int accepted = r->prompt(r->prompt_context, r->user, r->host, instructions, question, answer, sizeof(answer));
+        r->prompt_wait_ms += monotonic_ms() - before;
+        /* Time spent typing must not consume libssh2's network timeout. */
+        long timeout = r->prompt_wait_ms > LONG_MAX - 10000 ? LONG_MAX : (long)r->prompt_wait_ms + 10000;
+        libssh2_session_set_timeout(r->session, timeout);
+        if (!accepted || !memchr(answer, 0, sizeof(answer))) {
+            r->auth_cancelled = 1;
+            shutdown(r->socket, SHUT_RDWR);
+            OPENSSL_cleanse(answer, sizeof(answer));
+            return;
+        }
+        length = strlen(answer);
+        responses[i].text = secure_alloc(length + 1, abstract);
+        if (!responses[i].text) { r->auth_cancelled = 1; OPENSSL_cleanse(answer, sizeof(answer)); return; }
+        memcpy(responses[i].text, answer, length + 1);
+        responses[i].length = (unsigned)length;
+        OPENSSL_cleanse(answer, sizeof(answer));
+    }
+}
 
 static pthread_once_t ssh_once = PTHREAD_ONCE_INIT;
 static int ssh_init_result;
@@ -71,10 +171,24 @@ void dr_disconnect(DocyrusRemote *r) {
 
 DocyrusRemote *dr_connect(const char *host, unsigned short port, const char *user,
                           const char *root, const char *known_hosts, char *error, size_t capacity) {
+    return dr_connect_auth(host, port, user, root, known_hosts, NULL, NULL, NULL, error, capacity);
+}
+
+DocyrusRemote *dr_connect_auth(const char *host, unsigned short port, const char *user,
+                              const char *root, const char *known_hosts,
+                              DR_AUTH_PROMPT prompt, void *context, int *auth_status,
+                              char *error, size_t capacity) {
+    if (auth_status) *auth_status = 0;
     pthread_once(&ssh_once, ssh_init);
     DocyrusRemote *r = calloc(1, sizeof(*r));
     if (!r) { snprintf(error, capacity, "Out of memory."); return NULL; }
     r->socket = -1;
+    r->prompt = prompt;
+    r->prompt_context = context;
+    r->user = user;
+    r->host = host;
+    r->prompts_left = 8;
+    r->rounds_left = 8;
     snprintf(r->error, sizeof(r->error), "Cannot initialize SSH.");
     if (ssh_init_result) goto fail;
     struct addrinfo hints = {0}, *addresses = NULL;
@@ -107,7 +221,7 @@ DocyrusRemote *dr_connect(const char *host, unsigned short port, const char *use
         snprintf(r->error, sizeof(r->error), "Cannot reach the SSH server. Check the host, port, and network.");
         goto fail;
     }
-    r->session = libssh2_session_init();
+    r->session = libssh2_session_init_ex(secure_alloc, secure_free, secure_realloc, r);
     if (!r->session) goto fail;
     libssh2_session_set_timeout(r->session, 10000);
     libssh2_session_set_blocking(r->session, 1);
@@ -139,8 +253,9 @@ DocyrusRemote *dr_connect(const char *host, unsigned short port, const char *use
             : "SSH host is not trusted. Connect with OpenSSH in a terminal, verify its fingerprint, then retry. This client reads ~/.ssh/known_hosts.");
         goto fail;
     }
-    LIBSSH2_AGENT *agent = libssh2_agent_init(r->session);
-    int authenticated = 0;
+    const char *methods = libssh2_userauth_list(r->session, user, (unsigned)strlen(user));
+    int authenticated = libssh2_userauth_authenticated(r->session);
+    LIBSSH2_AGENT *agent = !authenticated && auth_method(methods, "publickey") ? libssh2_agent_init(r->session) : NULL;
     if (agent) {
         if (!libssh2_agent_connect(agent) && !libssh2_agent_list_identities(agent)) {
             struct libssh2_agent_publickey *identity = NULL, *previous = NULL;
@@ -153,7 +268,42 @@ DocyrusRemote *dr_connect(const char *host, unsigned short port, const char *use
         libssh2_agent_free(agent);
     }
     if (!authenticated) {
-        snprintf(r->error, sizeof(r->error), "SSH-agent authentication failed. Load your key with ssh-add and check the username. Password authentication is available in the SSH terminal.");
+        methods = libssh2_userauth_list(r->session, user, (unsigned)strlen(user));
+        int password = auth_method(methods, "password");
+        int interactive = auth_method(methods, "keyboard-interactive");
+        if ((password || interactive) && !prompt) {
+            if (auth_status) *auth_status = DR_AUTH_REQUIRED;
+            snprintf(r->error, sizeof(r->error), "Sign in to this connection with your SSH password.");
+            goto fail;
+        }
+        if (password && prompt) {
+            char answer[4097] = {0};
+            int accepted = prompt(context, user, host, "Enter your SSH password. It will not be saved.", "Password", answer, sizeof(answer));
+            if (!accepted || !memchr(answer, 0, sizeof(answer))) r->auth_cancelled = 1;
+            else authenticated = !libssh2_userauth_password_ex(r->session, user, (unsigned)strlen(user), answer, (unsigned)strlen(answer), NULL);
+            OPENSSL_cleanse(answer, sizeof(answer));
+        } else if (interactive && prompt) {
+            authenticated = !libssh2_userauth_keyboard_interactive(r->session, user, keyboard_answers);
+        }
+        if (r->auth_cancelled) {
+            if (auth_status) *auth_status = DR_AUTH_CANCELLED;
+            snprintf(r->error, sizeof(r->error), "Authentication cancelled.");
+            goto fail;
+        }
+        if (!authenticated) {
+            snprintf(r->error, sizeof(r->error), "%s", password || interactive
+                ? "Authentication failed. Check your username and password, then try again."
+                : "This server requires an SSH key. Load your key with ssh-add and check the username.");
+            goto fail;
+        }
+    }
+    r->prompt = NULL;
+    r->prompt_context = NULL;
+    r->user = NULL;
+    r->host = NULL;
+    libssh2_session_set_timeout(r->session, 10000);
+    if (!libssh2_userauth_authenticated(r->session)) {
+        snprintf(r->error, sizeof(r->error), "The server requires an additional authentication method. Check its SSH configuration.");
         goto fail;
     }
     r->sftp = libssh2_sftp_init(r->session);

@@ -23,6 +23,11 @@ pub fn build(b: *std.Build) void {
 }
 
 fn addRemoteClient(b: *std.Build, app: native_sdk.AppArtifacts) void {
+    const objc_flags: []const []const u8 = if (b.sysroot) |sysroot|
+        &.{ "-fobjc-arc", "-fno-sanitize=builtin", "-ObjC", "-mmacosx-version-min=11.0", "-isysroot", sysroot, b.fmt("-I{s}/usr/include", .{sysroot}) }
+    else
+        &.{ "-fobjc-arc", "-mmacosx-version-min=11.0" };
+    app.exe.root_module.addCSourceFile(.{ .file = b.path("src/remote_auth_prompt.m"), .flags = objc_flags });
     const ssh2 = b.dependency("libssh2", .{});
     const openssl = b.option([]const u8, "openssl-prefix", "OpenSSL 3 prefix (statically linked)") orelse "/opt/homebrew/opt/openssl@3";
     const module = b.createModule(.{
