@@ -17,7 +17,7 @@
     "pretest": "npm run patch:native-sdk",
     "test": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" native test && npm run test:terminal && npm run test:remote",
     "test:terminal": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" zig build test-terminal",
-    "test:remote": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" zig build remote-test-client && node scripts/test-remote.mjs && node scripts/test-remote-auth.mjs"
+    "test:remote": "PATH=\"$HOME/.native/toolchains/zig-0.16.0:$PATH\" zig build remote-test-client && node scripts/test-remote.mjs && node scripts/test-remote-auth.mjs && node --test scripts/test-remote-folders.mjs"
   },
   "dependencies": {
     "@native-sdk/core": "0.11.0",

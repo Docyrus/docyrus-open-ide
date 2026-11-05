@@ -1,4 +1,5 @@
 import { FileTree, themeToTreeStyles } from "@pierre/trees";
+import { observeRemoteFolders } from "./remote-folders.mjs";
 
 const params = new URLSearchParams(window.location.search);
 const projectId = Number(params.get("project") || 0);
@@ -649,51 +650,14 @@ async function loadTreePaths(directoryPath = "") {
 }
 
 function loadRemoteFoldersOnExpansion(currentTree, initialPaths) {
-  let expanded = new Set();
-  let queue = Promise.resolve();
-  const children = new Map();
-  const directories = new Set(initialPaths.filter(path => path.endsWith("/")));
-  currentTree.subscribe(() => {
-    if (tree !== currentTree) return;
-    for (const row of currentTree.getVisibleRows(0, currentTree.getVisibleCount())) {
-      if (row.kind === "directory") directories.add(row.path);
-    }
-    const next = new Set([...directories].filter(path => {
-      const item = currentTree.getItem(path);
-      return item?.isDirectory() && item.isExpanded();
-    }));
-    for (const path of next) {
-      if (expanded.has(path)) continue;
-      queue = queue.then(async () => {
-        const item = currentTree.getItem(path);
-        if (tree !== currentTree || !item?.isDirectory() || !item.isExpanded()) return;
-        const ticket = setStatus(`Loading ${path}…`);
-        try {
-          const listing = await loadTreePaths(path);
-          if (tree !== currentTree || !currentTree.getItem(path)?.isDirectory()) return;
-          const fresh = new Set(listing.paths);
-          const operations = [];
-          for (const previous of children.get(path) || []) {
-            if (!fresh.has(previous)) {
-              operations.push({ type: "remove", path: previous, recursive: true });
-              if (previous.endsWith("/")) for (const directory of directories) {
-                if (directory.startsWith(previous)) { directories.delete(directory); children.delete(directory); }
-              }
-            }
-          }
-          for (const child of fresh) {
-            if (child.endsWith("/")) directories.add(child);
-            if (!currentTree.getItem(child)) operations.push({ type: "add", path: child });
-          }
-          children.set(path, fresh);
-          currentTree.batch(operations);
-          if (statusTicket === ticket) setStatus(`${listing.paths.length} items in ${path}${listing.truncated ? " • folder limit reached" : ""}`);
-        } catch (error) {
-          if (tree === currentTree) reportError(error, `Could not load ${path}`);
-        }
-      });
-    }
-    expanded = next;
+  observeRemoteFolders(currentTree, initialPaths, {
+    isCurrent: () => tree === currentTree,
+    loadDirectory: loadTreePaths,
+    onLoading: path => setStatus(`Loading ${path}…`),
+    onLoaded(path, listing, ticket) {
+      if (statusTicket === ticket) setStatus(`${listing.paths.length} items in ${path}${listing.truncated ? " • folder limit reached" : ""}`);
+    },
+    onError: (path, error) => reportError(error, `Could not load ${path}`),
   });
 }
 
