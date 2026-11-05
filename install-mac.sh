@@ -4,7 +4,7 @@ set -euo pipefail
 APP_NAME="Docyrus Open IDE"
 RELEASE_TAG="v0.1.13"
 ARCHIVE_NAME="Docyrus-Open-IDE-v0.1.13-macos-arm64.zip"
-EXPECTED_SHA256="9f0156260e1fa4f6bdb38440550af0b196a655d705ea9ef2305c77cfb3154d96"
+EXPECTED_SHA256="55499fc97d2272de5d35736522ba756a264d7d1a6100d36aea9d7488a79b06b4"
 INSTALL_PATH="/Applications/${APP_NAME}.app"
 DOWNLOAD_URL="https://github.com/Docyrus/docyrus-open-ide/releases/download/${RELEASE_TAG}/${ARCHIVE_NAME}"
 
