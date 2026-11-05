@@ -49,7 +49,14 @@ function languageFor(path) {
 
 async function invoke(command, payload) {
   if (!window.zero?.invoke) throw new Error("Native bridge is unavailable");
-  return window.zero.invoke(command, payload);
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await window.zero.invoke(command, payload);
+    } catch (error) {
+      if (attempt >= 1800 || !/RemoteBusy|RemoteConnectionPending/.test(error?.message || "")) throw error;
+      await new Promise(resolve => window.setTimeout(resolve, 100));
+    }
+  }
 }
 
 applyDocumentTheme();

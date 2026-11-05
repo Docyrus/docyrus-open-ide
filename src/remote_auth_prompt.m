@@ -47,6 +47,10 @@ int docyrus_remote_auth_prompt(void *context, const char *user, const char *host
             [request.condition lock];
             if (request.completed) { [request.condition unlock]; return; }
             NSWindow *parent = NSApp.keyWindow ?: NSApp.mainWindow;
+            if (parent.sheetParent) parent = parent.sheetParent;
+            if (!parent) for (NSWindow *window in NSApp.orderedWindows) {
+                if (window.isVisible && !window.miniaturized && !window.sheetParent) { parent = window; break; }
+            }
             if (!parent) {
                 request.completed = YES;
                 [request.condition signal];

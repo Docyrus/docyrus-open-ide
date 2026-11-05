@@ -105,6 +105,7 @@ pub const Client = struct {
     handle: *c.DocyrusRemote,
     uri: [1025:0]u8 = @splat(0),
     tree: ?Listing = null,
+    search_tree: ?Listing = null,
 
     pub fn connect(uri: []const u8, home: []const u8, message: []u8) !Client {
         return connectWithPrompt(uri, home, message, null, null);
@@ -126,7 +127,19 @@ pub const Client = struct {
     }
     pub fn deinit(self: *Client) void {
         if (self.tree) |*tree| tree.deinit();
+        if (self.search_tree) |*tree| tree.deinit();
         c.dr_disconnect(self.handle);
+    }
+    pub fn cancel(self: *Client) void {
+        c.dr_cancel(self.handle);
+    }
+    pub fn listDirectoryWithDeadline(self: *Client, path: []const u8, timeout_ms: u32) !Listing {
+        c.dr_set_deadline(self.handle, timeout_ms);
+        defer c.dr_set_deadline(self.handle, 0);
+        return self.listDirectory(path) catch |err| {
+            if (c.dr_check_deadline(self.handle) != 0) return error.RemoteDirectoryTimedOut;
+            return err;
+        };
     }
     pub fn stat(self: *Client, path: []const u8) !bool {
         var buffer: [max_path:0]u8 = undefined;
@@ -187,10 +200,16 @@ pub const Client = struct {
     pub fn list(self: *Client, path: []const u8, filtered: bool) !Listing {
         var listing: Listing = .{};
         errdefer listing.deinit();
-        try self.walk(&listing, path, filtered, 0);
+        try self.walk(&listing, path, filtered, true, 0);
         return listing;
     }
-    fn walk(self: *Client, listing: *Listing, path: []const u8, filtered: bool, depth: usize) anyerror!void {
+    pub fn listDirectory(self: *Client, path: []const u8) !Listing {
+        var listing: Listing = .{};
+        errdefer listing.deinit();
+        try self.walk(&listing, path, false, false, 0);
+        return listing;
+    }
+    fn walk(self: *Client, listing: *Listing, path: []const u8, filtered: bool, recursive: bool, depth: usize) anyerror!void {
         if (depth >= 32) {
             listing.truncated = true;
             return;
@@ -224,7 +243,7 @@ pub const Client = struct {
                 continue;
             }
             try listing.entries.append(arena, .{ .path = child, .directory = directory == 1 });
-            if (directory == 1) try self.walk(listing, child, filtered, depth + 1);
+            if (recursive and directory == 1) try self.walk(listing, child, filtered, true, depth + 1);
         }
     }
     pub fn remove(self: *Client, path: []const u8) !void {
@@ -284,6 +303,21 @@ fn ignored(name: []const u8) bool {
 
 pub const Manager = struct {
     clients: [10]?Client = @splat(null),
+    pub fn cached(self: *Manager, uri: []const u8) ?*Client {
+        for (&self.clients) |*slot| if (slot.*) |*client| {
+            if (std.mem.eql(u8, std.mem.sliceTo(&client.uri, 0), uri) and c.dr_alive(client.handle) != 0) return client;
+        };
+        return null;
+    }
+    pub fn take(self: *Manager, uri: []const u8) ?Client {
+        for (&self.clients) |*slot| if (slot.*) |client| {
+            if (std.mem.eql(u8, std.mem.sliceTo(&client.uri, 0), uri)) {
+                slot.* = null;
+                return client;
+            }
+        };
+        return null;
+    }
     pub fn deinit(self: *Manager) void {
         for (&self.clients) |*slot| if (slot.*) |*client| {
             client.deinit();

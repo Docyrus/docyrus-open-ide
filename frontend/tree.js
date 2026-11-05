@@ -104,7 +104,14 @@ function applyTheme() {
 
 async function invoke(command, payload) {
   if (!window.zero?.invoke) throw new Error("Native bridge is unavailable");
-  return window.zero.invoke(command, { ...payload, projectId });
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await window.zero.invoke(command, { ...payload, projectId });
+    } catch (error) {
+      if (attempt >= 1800 || !/RemoteBusy|RemoteConnectionPending/.test(error?.message || "")) throw error;
+      await new Promise(resolve => window.setTimeout(resolve, 100));
+    }
+  }
 }
 
 function messageFrom(error, fallback) {
@@ -597,16 +604,25 @@ function renderContextMenu(item, context) {
 
 /* File tree -------------------------------------------------------------- */
 
-async function loadTreePaths() {
+async function loadTreePaths(directoryPath = "") {
   const paths = [];
   let root = "";
   let editable = false;
   let offset = 0;
   let skipped = 0;
   let truncated = false;
+  let refresh = true;
+  let lazy = false;
+  let pending = 0;
 
   while (true) {
-    const result = await invoke("workspace.listTree", { offset });
+    const result = await invoke("workspace.listTree", { offset, path: directoryPath, refresh });
+    refresh = false;
+    if (result?.pending) {
+      if (++pending > 1800) throw new Error("The remote folder is taking too long to respond. Try again.");
+      await new Promise(resolve => window.setTimeout(resolve, 100));
+      continue;
+    }
     const pagePaths = Array.isArray(result) ? result : result?.paths;
     const pageRoot = Array.isArray(result) ? "" : result?.root;
     if (!Array.isArray(pagePaths) || typeof pageRoot !== "string") {
@@ -615,6 +631,7 @@ async function loadTreePaths() {
     if (offset === 0) {
       root = pageRoot;
       editable = Boolean(result?.editable);
+      lazy = Boolean(result?.lazy);
     }
     paths.push(...pagePaths);
     skipped = Math.max(skipped, Number(result?.skipped || 0));
@@ -628,13 +645,62 @@ async function loadTreePaths() {
     offset = nextOffset;
   }
 
-  return { paths, root, editable, skipped, truncated };
+  return { paths, root, editable, skipped, truncated, lazy };
+}
+
+function loadRemoteFoldersOnExpansion(currentTree, initialPaths) {
+  let expanded = new Set();
+  let queue = Promise.resolve();
+  const children = new Map();
+  const directories = new Set(initialPaths.filter(path => path.endsWith("/")));
+  currentTree.subscribe(() => {
+    if (tree !== currentTree) return;
+    for (const row of currentTree.getVisibleRows(0, currentTree.getVisibleCount())) {
+      if (row.kind === "directory") directories.add(row.path);
+    }
+    const next = new Set([...directories].filter(path => {
+      const item = currentTree.getItem(path);
+      return item?.isDirectory() && item.isExpanded();
+    }));
+    for (const path of next) {
+      if (expanded.has(path)) continue;
+      queue = queue.then(async () => {
+        const item = currentTree.getItem(path);
+        if (tree !== currentTree || !item?.isDirectory() || !item.isExpanded()) return;
+        const ticket = setStatus(`Loading ${path}…`);
+        try {
+          const listing = await loadTreePaths(path);
+          if (tree !== currentTree || !currentTree.getItem(path)?.isDirectory()) return;
+          const fresh = new Set(listing.paths);
+          const operations = [];
+          for (const previous of children.get(path) || []) {
+            if (!fresh.has(previous)) {
+              operations.push({ type: "remove", path: previous, recursive: true });
+              if (previous.endsWith("/")) for (const directory of directories) {
+                if (directory.startsWith(previous)) { directories.delete(directory); children.delete(directory); }
+              }
+            }
+          }
+          for (const child of fresh) {
+            if (child.endsWith("/")) directories.add(child);
+            if (!currentTree.getItem(child)) operations.push({ type: "add", path: child });
+          }
+          children.set(path, fresh);
+          currentTree.batch(operations);
+          if (statusTicket === ticket) setStatus(`${listing.paths.length} items in ${path}${listing.truncated ? " • folder limit reached" : ""}`);
+        } catch (error) {
+          if (tree === currentTree) reportError(error, `Could not load ${path}`);
+        }
+      });
+    }
+    expanded = next;
+  });
 }
 
 async function renderTree() {
   setStatus("Loading project files…");
   try {
-    const { paths, root, editable, skipped, truncated } = await loadTreePaths();
+    const { paths, root, editable, skipped, truncated, lazy } = await loadTreePaths();
     treeEditable = editable;
     treeRemote = /^(ssh|sftp):\/\//.test(root);
     treeRootLabel = basenameOf(root) || root || "project";
@@ -671,12 +737,13 @@ async function renderTree() {
         : undefined,
     });
     tree.render({ containerWrapper: mount });
+    if (lazy) loadRemoteFoldersOnExpansion(tree, paths);
     applyTheme();
 
-    // A reload (refresh, theme change) rebuilds the tree, so re-adopt the
-    // copied path only while it still exists in the project.
+    // Remote descendants may not be loaded yet; the server validates the
+    // copied source when pasting. Local trees already contain every path.
     const stored = readStoredClipboard();
-    setClipboardPath(stored && tree.getItem(stored) ? stored : null);
+    setClipboardPath(stored && (lazy || tree.getItem(stored)) ? stored : null);
 
     const notes = [];
     if (truncated) notes.push(`showing first ${paths.length.toLocaleString()}`);

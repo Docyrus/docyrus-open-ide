@@ -4788,6 +4788,25 @@ const RemoteConnectJob = struct {
     }
 };
 
+// The worker exclusively owns this session until the main loop collects it.
+// Neither libssh2 nor the model is accessed concurrently across threads.
+const RemoteDirectoryJob = struct {
+    client: remote.Client,
+    path: [remote.max_path:0]u8 = @splat(0),
+    failure: ?anyerror = null,
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn run(self: *RemoteDirectoryJob) void {
+        if (self.client.tree) |*tree| tree.deinit();
+        self.client.tree = self.client.listDirectoryWithDeadline(std.mem.sliceTo(&self.path, 0), 30000) catch |err| blk: {
+            self.failure = err;
+            break :blk null;
+        };
+        self.done.store(true, .release);
+    }
+};
+
 const AppHost = struct {
     ui: *DocyrusApp,
     base: native_sdk.App,
@@ -4795,6 +4814,10 @@ const AppHost = struct {
     runtime: ?*native_sdk.Runtime = null,
     remote_clients: remote.Manager = .{},
     remote_job: ?*RemoteConnectJob = null,
+    remote_directory_job: ?*RemoteDirectoryJob = null,
+    remote_directory_uri: [1025:0]u8 = @splat(0),
+    remote_directory_path: [remote.max_path:0]u8 = @splat(0),
+    remote_directory_failure: ?anyerror = null,
     preferences_path: [1024]u8 = undefined,
     preferences_path_len: usize = 0,
     pending_open_files: [max_pending_open_files]ExternalFile = [_]ExternalFile{.{}} ** max_pending_open_files,
@@ -4855,6 +4878,7 @@ const AppHost = struct {
 
     fn eventFn(context: *anyopaque, runtime: *native_sdk.Runtime, event: native_sdk.Event) anyerror!void {
         const self: *AppHost = @ptrCast(@alignCast(context));
+        try self.serviceRemoteDirectory();
         try self.base.event(runtime, event);
         try self.serviceRemoteConnection();
         switch (event) {
@@ -4962,6 +4986,13 @@ const AppHost = struct {
         const self: *AppHost = @ptrCast(@alignCast(context));
         self.persistState(true);
         docyrus_remote_cancel_auth_prompts();
+        if (self.remote_directory_job) |job| {
+            job.client.cancel();
+            if (job.thread) |thread| thread.join();
+            job.client.deinit();
+            std.heap.page_allocator.destroy(job);
+            self.remote_directory_job = null;
+        }
         if (self.remote_job) |job| {
             if (job.thread) |thread| thread.join();
             if (job.client) |*client| client.deinit();
@@ -4986,6 +5017,11 @@ const AppHost = struct {
                     var unused = client;
                     unused.deinit();
                 };
+                if (job.client != null) {
+                    self.remote_directory_uri = @splat(0);
+                    self.remote_directory_path = @splat(0);
+                    self.remote_directory_failure = null;
+                }
                 std.heap.page_allocator.destroy(job);
                 self.remote_job = null;
             }
@@ -4999,6 +5035,10 @@ const AppHost = struct {
             }
         };
         if (!self.ui.model.remote_connect_requested or self.remote_job != null) return;
+        if (self.remote_directory_job) |job| {
+            job.client.cancel();
+            return;
+        }
         self.ui.model.remote_connect_requested = false;
         const channel = self.ui.effects.channelHandle(remote_channel_key) orelse return;
         if (!channel.live()) return;
@@ -5016,17 +5056,31 @@ const AppHost = struct {
         self.remote_job = job;
     }
 
+    fn serviceRemoteDirectory(self: *AppHost) !void {
+        const job = self.remote_directory_job orelse return;
+        if (!job.done.load(.acquire)) return;
+        if (job.thread) |thread| thread.join();
+        self.remote_directory_failure = job.failure;
+        if (self.ui.model.findProject(std.mem.sliceTo(&job.client.uri, 0)) != null) {
+            self.remote_clients.adopt(job.client) catch job.client.deinit();
+        } else job.client.deinit();
+        std.heap.page_allocator.destroy(job);
+        self.remote_directory_job = null;
+    }
+
     fn remoteClient(self: *AppHost, project: *const ProjectState) !*remote.Client {
         if (project.kind != .remote) return error.InvalidProject;
-        var message: [512]u8 = @splat(0);
-        const client = self.remote_clients.get(project.path(), self.ui.model.homePath(), &message) catch |err| {
-            if (self.runtime) |runtime| {
-                if (err == error.PasswordAuthenticationRequired) self.ui.dispatch(runtime, 1, .{ .remote_authentication_required = project.path() }) catch {} else self.ui.dispatch(runtime, 1, .{ .remote_error_message = if (message[0] != 0) std.mem.sliceTo(&message, 0) else @errorName(err) }) catch {};
-            }
-            return err;
-        };
-        self.ui.model.remote_error_buffer.clear();
-        return client;
+        try self.serviceRemoteDirectory();
+        if (self.remote_directory_job) |job| {
+            if (std.mem.eql(u8, project.path(), std.mem.sliceTo(&job.client.uri, 0))) return error.RemoteBusy;
+        }
+        if (self.remote_clients.cached(project.path())) |client| return client;
+        // Reconnecting from a bridge request must also stay off the UI thread.
+        if (!self.ui.model.remote_connecting) {
+            if (self.ui.model.has_remote_error() and std.mem.eql(u8, self.ui.model.remote_url(), project.path())) return error.RemoteConnectionFailed;
+            if (self.runtime) |runtime| try self.ui.dispatch(runtime, 1, .{ .remote_authentication_required = project.path() });
+        }
+        return error.RemoteConnectionPending;
     }
 
     fn hydrateRemoteTabs(self: *AppHost, project: *ProjectState) !void {
@@ -5166,13 +5220,34 @@ const AppHost = struct {
         const active = try self.activeBridgeProject(invocation);
         if (active.project.kind == .external_files) return writeExternalTreeJson(&self.ui.model, parsed.value.offset, output);
         if (active.project.kind == .remote) {
-            const client = try self.remoteClient(active.project);
-            if (parsed.value.offset == 0) {
-                self.hydrateRemoteTabs(active.project) catch {};
-                if (client.tree) |*tree| tree.deinit();
-                client.tree = null;
-                client.tree = try client.list("", true);
+            const path = trimTreePath(parsed.value.path);
+            if (path.len >= remote.max_path or (path.len > 0 and !isSafeRelativePath(path))) return error.InvalidPath;
+            try self.serviceRemoteDirectory();
+            if (self.ui.model.remote_connecting) return "{\"pending\":true}";
+            if (self.remote_directory_job != null) return "{\"pending\":true}";
+            const same_directory = std.mem.eql(u8, active.project.path(), std.mem.sliceTo(&self.remote_directory_uri, 0)) and std.mem.eql(u8, path, std.mem.sliceTo(&self.remote_directory_path, 0));
+            if (same_directory and !parsed.value.refresh) if (self.remote_directory_failure) |err| return err;
+            const client = self.remoteClient(active.project) catch |err| switch (err) {
+                error.RemoteBusy, error.RemoteConnectionPending => return "{\"pending\":true}",
+                else => return err,
+            };
+            if (parsed.value.offset == 0 and (parsed.value.refresh or !same_directory or client.tree == null)) {
+                const job = try std.heap.page_allocator.create(RemoteDirectoryJob);
+                errdefer std.heap.page_allocator.destroy(job);
+                job.* = .{ .client = self.remote_clients.take(active.project.path()).? };
+                @memcpy(job.path[0..path.len], path);
+                job.thread = std.Thread.spawn(.{}, RemoteDirectoryJob.run, .{job}) catch |err| {
+                    self.remote_clients.adopt(job.client) catch job.client.deinit();
+                    return err;
+                };
+                self.remote_directory_uri = job.client.uri;
+                self.remote_directory_path = job.path;
+                self.remote_directory_failure = null;
+                self.remote_directory_job = job;
+                return "{\"pending\":true}";
             }
+            if (!same_directory) return error.InvalidTreeOffset;
+            self.hydrateRemoteTabs(active.project) catch {};
             return writeRemoteTreeJson(active.project.path(), &(client.tree orelse return error.InvalidTreeOffset), parsed.value.offset, output);
         }
         return writeProjectTreeJson(self.io, active.project.path(), parsed.value.offset, output);
@@ -5494,6 +5569,8 @@ fn ignoredDirectory(name: []const u8) bool {
 
 const BridgeTreePage = struct {
     offset: usize = 0,
+    path: []const u8 = "",
+    refresh: bool = true,
 };
 
 fn writeExternalTreeJson(model: *const Model, offset: usize, output: []u8) ![]const u8 {
@@ -5538,7 +5615,7 @@ fn writeRemoteTreeJson(uri: []const u8, listing: *const remote.Listing, offset: 
         try writer.writeAll(encoded);
         index += 1;
     }
-    try writer.print("],\"nextOffset\":{d},\"done\":{s},\"truncated\":{s},\"skipped\":{d},\"editable\":true}}", .{
+    try writer.print("],\"nextOffset\":{d},\"done\":{s},\"truncated\":{s},\"skipped\":{d},\"editable\":true,\"lazy\":true}}", .{
         index, if (index >= listing.entries.items.len) "true" else "false", if (listing.truncated) "true" else "false", listing.skipped,
     });
     return writer.buffered();
@@ -6030,10 +6107,10 @@ fn writeSearchJson(io: std.Io, project_path: []const u8, request: BridgeSearchRe
 
 fn writeRemoteSearchJson(client: *remote.Client, request: BridgeSearchRequest, output: []u8) ![]const u8 {
     if (request.query.len == 0 or request.query.len > search_max_query_bytes) return error.InvalidSearchQuery;
-    if (client.tree == null or (request.fileOffset == 0 and request.matchOffset == 0)) {
-        if (client.tree) |*tree| tree.deinit();
-        client.tree = null;
-        client.tree = try client.list("", true);
+    if (client.search_tree == null or (request.fileOffset == 0 and request.matchOffset == 0)) {
+        if (client.search_tree) |*tree| tree.deinit();
+        client.search_tree = null;
+        client.search_tree = try client.list("", true);
     }
     var writer: std.Io.Writer = .fixed(output);
     try writer.writeAll("{\"matches\":[");
@@ -6041,10 +6118,10 @@ fn writeRemoteSearchJson(client: *remote.Client, request: BridgeSearchRequest, o
     var next_file = request.fileOffset;
     var next_match = request.matchOffset;
     var scanned: usize = 0;
-    var skipped: usize = client.tree.?.skipped;
+    var skipped: usize = client.search_tree.?.skipped;
     var first = true;
     var done = true;
-    walk: for (client.tree.?.entries.items) |entry| {
+    walk: for (client.search_tree.?.entries.items) |entry| {
         if (entry.directory or !searchPathAllowed(entry.path, request.include, request.exclude)) continue;
         const current = file_index;
         file_index += 1;

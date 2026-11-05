@@ -32,6 +32,7 @@ struct DocyrusRemote {
     unsigned prompts_left;
     unsigned rounds_left;
     long long prompt_wait_ms;
+    long long deadline_ms;
 };
 
 /* libssh2 also copies answers into protocol packets. Wipe its allocations on
@@ -80,6 +81,18 @@ static long long monotonic_ms(void) {
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (long long)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+void dr_cancel(DocyrusRemote *r) { shutdown(r->socket, SHUT_RDWR); }
+void dr_set_deadline(DocyrusRemote *r, unsigned timeout_ms) {
+    r->deadline_ms = timeout_ms ? monotonic_ms() + timeout_ms : 0;
+    libssh2_session_set_timeout(r->session, timeout_ms ? timeout_ms : 10000);
+}
+int dr_check_deadline(DocyrusRemote *r) {
+    if (!r->deadline_ms) return 0;
+    long long remaining = r->deadline_ms - monotonic_ms();
+    libssh2_session_set_timeout(r->session, remaining > 0 ? (long)remaining : 1);
+    return remaining <= 0 || libssh2_session_last_errno(r->session) == LIBSSH2_ERROR_TIMEOUT;
 }
 
 static void keyboard_answers(const char *name, int name_len, const char *instruction,
@@ -360,6 +373,7 @@ static int path_for(DocyrusRemote *r, const char *relative, char *absolute, int 
         end += size;
         absolute[end] = 0;
         LIBSSH2_SFTP_ATTRIBUTES attrs = {0};
+        if (dr_check_deadline(r)) return DR_ERROR;
         if (libssh2_sftp_lstat(r->sftp, absolute, &attrs)) {
             int rc = failure(r, "Inspect path");
             if (!slash && allow_missing && rc == DR_NOT_FOUND) return 0;
@@ -384,10 +398,13 @@ int dr_stat(DocyrusRemote *r, const char *path, int *directory) {
 }
 void *dr_opendir(DocyrusRemote *r, const char *path) {
     char absolute[4096];
+    if (dr_check_deadline(r)) return NULL;
     if (path_for(r, path, absolute, 0)) return NULL;
+    if (dr_check_deadline(r)) return NULL;
     return libssh2_sftp_opendir(r->sftp, absolute);
 }
 int dr_readdir(DocyrusRemote *r, void *handle, char *name, size_t capacity, int *directory) {
+    if (dr_check_deadline(r)) return DR_ERROR;
     LIBSSH2_SFTP_ATTRIBUTES attrs = {0};
     int n = libssh2_sftp_readdir_ex(handle, name, capacity - 1, NULL, 0, &attrs);
     if (n < 0) return failure(r, "Read directory");

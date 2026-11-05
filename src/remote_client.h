@@ -18,6 +18,10 @@ DocyrusRemote *dr_connect_auth(const char *host, unsigned short port, const char
                               DR_AUTH_PROMPT prompt, void *context, int *auth_status,
                               char *error, size_t capacity);
 void dr_disconnect(DocyrusRemote *remote);
+/* Interrupt an in-flight worker without freeing its session. */
+void dr_cancel(DocyrusRemote *remote);
+void dr_set_deadline(DocyrusRemote *remote, unsigned timeout_ms);
+int dr_check_deadline(DocyrusRemote *remote);
 int dr_alive(DocyrusRemote *remote);
 const char *dr_error(DocyrusRemote *remote);
 int dr_stat(DocyrusRemote *remote, const char *path, int *directory);

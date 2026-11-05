@@ -44,6 +44,13 @@ pub fn main(init: std.process.Init) !void {
     try expectFailure(error.UnsafeRemotePath, client.read("escape/outside.txt", 1024));
     try expectFailure(error.UnsafeRemotePath, client.stat("escape"));
     try client.create("nested/deep/notes 'quoted'.txt", false);
+    var top_level = try client.listDirectory("");
+    defer top_level.deinit();
+    for (top_level.entries.items) |entry| try require(std.mem.indexOfScalar(u8, entry.path, '/') == null);
+    var nested_level = try client.listDirectory("nested");
+    defer nested_level.deinit();
+    try require(nested_level.entries.items.len == 1);
+    try require(std.mem.eql(u8, nested_level.entries.items[0].path, "nested/deep"));
     try expectFailure(error.PathAlreadyExists, client.create("nested/deep/notes 'quoted'.txt", false));
     try client.write("nested/deep/notes 'quoted'.txt", "Saved atomically: 你好\n", false);
     const saved = try client.read("nested/deep/notes 'quoted'.txt", 1024);
@@ -115,6 +122,19 @@ fn testAuthentication(args: []const [:0]const u8, io: std.Io) !void {
     };
     defer client.deinit();
     try require(replies.calls == (if (std.mem.eql(u8, args[5], "keyboard-interactive")) @as(usize, 2) else 1));
+    if (std.mem.eql(u8, args[5], "deadline")) {
+        try expectFailure(error.RemoteDirectoryTimedOut, client.listDirectoryWithDeadline("", 200));
+        std.debug.print("Slow remote folder request timed out without an unbounded scan.\n", .{});
+        return;
+    }
+    var root = try client.listDirectoryWithDeadline("", 1000);
+    defer root.deinit();
+    try require(root.entries.items.len == 3);
+    for (root.entries.items) |entry| try require(std.mem.indexOfScalar(u8, entry.path, '/') == null);
+    var folder = try client.listDirectoryWithDeadline("folder", 1000);
+    defer folder.deinit();
+    try require(folder.entries.items.len == 2);
+    for (folder.entries.items) |entry| try require(std.mem.startsWith(u8, entry.path, "folder/") and std.mem.indexOfScalar(u8, entry.path[7..], '/') == null);
     const content = try client.read("hello.txt", 1024);
     defer std.heap.page_allocator.free(content);
     try require(std.mem.eql(u8, content, "Authenticated SFTP\n"));
